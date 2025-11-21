@@ -1,0 +1,41 @@
+{
+  "name": "zs",
+  "version": "0.1.0",
+  "description": "ZigScript - A modern, type-safe scripting language that compiles to WebAssembly",
+  "author": "ghostkellz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ghostkellz/zs"
+  },
+  "keywords": [
+    "wasm",
+    "webassembly",
+    "scripting",
+    "compiler",
+    "async",
+    "typescript-alternative"
+  ],
+  "main": "src/root.zig",
+  "bin": {
+    "zs": "src/main.zig"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "scripts": {
+    "build": "zig build",
+    "test": "zig build test",
+    "install": "zig build install"
+  },
+  "files": [
+    "src/",
+    "stdlib/",
+    "examples/",
+    "build.zig",
+    "build.zig.zon",
+    "README.md"
+  ],
+  "engines": {
+    "zig": ">=0.16.0"
+  }
+}
