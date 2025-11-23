@@ -1,6 +1,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const wasm_memory = @import("wasm_memory.zig");
+const module_resolver = @import("module_resolver.zig");
 
 pub const CodegenError = error{
     UnsupportedFeature,
@@ -17,7 +18,10 @@ pub const WasmCodegen = struct {
     indent_level: usize,
     local_count: usize,
     locals: std.StringHashMap(usize), // variable name -> local index
+    local_types: std.StringHashMap([]const u8), // variable name -> type name (for structs)
     memory_allocator: wasm_memory.WasmAllocator,
+    module: ?*ast.Module, // Reference to AST module for type lookups
+    lambda_count: usize, // Counter for generating unique lambda function names
 
     pub fn init(allocator: std.mem.Allocator) WasmCodegen {
         return .{
@@ -26,16 +30,63 @@ pub const WasmCodegen = struct {
             .indent_level = 0,
             .local_count = 0,
             .locals = std.StringHashMap(usize).init(allocator),
+            .local_types = std.StringHashMap([]const u8).init(allocator),
             .memory_allocator = wasm_memory.WasmAllocator.init(),
+            .module = null,
+            .lambda_count = 0,
         };
     }
 
     pub fn deinit(self: *WasmCodegen) void {
         self.output.deinit(self.allocator);
         self.locals.deinit();
+        self.local_types.deinit();
+    }
+
+    // Helper: Infer if expression is f64 type
+    fn isF64Expr(self: *WasmCodegen, expr: *const ast.Expr) bool {
+        return switch (expr.*) {
+            .float_literal => true,
+            .integer_literal => false,
+            .bool_literal => false,
+            .string_literal => false,
+            .binary => |*bin| self.isF64Expr(bin.left) or self.isF64Expr(bin.right),
+            .unary => |*un| self.isF64Expr(un.operand),
+            else => false, // Conservative: assume i32
+        };
+    }
+
+    // Helper: Get field offset in a struct
+    // Returns the byte offset of a field, or null if not found
+    fn getFieldOffset(self: *WasmCodegen, struct_name: []const u8, field_name: []const u8) ?u32 {
+        const module = self.module orelse return null;
+
+        // Find the struct declaration
+        for (module.stmts) |stmt| {
+            if (stmt == .struct_decl) {
+                const struct_decl = stmt.struct_decl;
+                if (std.mem.eql(u8, struct_decl.name, struct_name)) {
+                    // Find the field index
+                    for (struct_decl.fields, 0..) |field, i| {
+                        if (std.mem.eql(u8, field.name, field_name)) {
+                            // Each field is 4 bytes for now (simple layout)
+                            return @as(u32, @intCast(i)) * 4;
+                        }
+                    }
+                    return null; // Field not found
+                }
+            }
+        }
+        return null; // Struct not found
     }
 
     pub fn generate(self: *WasmCodegen, module: *ast.Module) ![]const u8 {
+        return self.generateWithResolver(module, null);
+    }
+
+    pub fn generateWithResolver(self: *WasmCodegen, module: *ast.Module, resolver: ?*module_resolver.ModuleResolver) ![]const u8 {
+        self.module = module; // Store module reference for type lookups
+
         try self.emit("(module\n");
         self.indent_level += 1;
 
@@ -63,7 +114,12 @@ pub const WasmCodegen = struct {
 
         try self.emit("\n");
 
-        // Generate code for each statement
+        // If we have a resolver, generate imported functions first
+        if (resolver) |res| {
+            try self.generateImportedFunctions(module, res);
+        }
+
+        // Generate code for each statement in this module
         for (module.stmts) |*stmt| {
             try self.genStmt(stmt);
         }
@@ -72,6 +128,56 @@ pub const WasmCodegen = struct {
         try self.emit(")\n");
 
         return self.output.items;
+    }
+
+    fn generateImportedFunctions(self: *WasmCodegen, module: *ast.Module, resolver: *module_resolver.ModuleResolver) !void {
+        // Find all import statements
+        for (module.stmts) |stmt| {
+            if (stmt == .import_stmt) {
+                const import_stmt = stmt.import_stmt;
+
+                // Find the loaded module
+                var module_iter = resolver.modules.iterator();
+                while (module_iter.next()) |entry| {
+                    // Check if path ends with import name
+                    const search_patterns = [_][]const u8{
+                        import_stmt.from,
+                        try std.fmt.allocPrint(self.allocator, "{s}.zs", .{import_stmt.from}),
+                        try std.fmt.allocPrint(self.allocator, "examples/{s}", .{import_stmt.from}),
+                        try std.fmt.allocPrint(self.allocator, "examples/{s}.zs", .{import_stmt.from}),
+                    };
+
+                    var found = false;
+                    for (search_patterns) |pattern| {
+                        if (std.mem.endsWith(u8, entry.key_ptr.*, pattern)) {
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (found) {
+                        const imported_module = entry.value_ptr;
+
+                        // Generate each imported function
+                        for (import_stmt.imports) |item| {
+                            if (imported_module.exports.get(item.name)) |export_item| {
+                                if (export_item == .function) {
+                                    // Temporarily set module to the imported module for struct lookups
+                                    const saved_module = self.module;
+                                    self.module = imported_module.ast;
+
+                                    try self.genFnDecl(export_item.function);
+
+                                    // Restore module
+                                    self.module = saved_module;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn genStmt(self: *WasmCodegen, stmt: *ast.Stmt) !void {
@@ -115,7 +221,13 @@ pub const WasmCodegen = struct {
                 try self.emitIndent();
                 try self.emit("br $continue\n");
             },
-            .struct_decl, .enum_decl, .import_stmt => {
+            .struct_decl => |*struct_decl| {
+                // Generate methods for the struct
+                for (struct_decl.methods) |*method| {
+                    try self.genStructMethod(struct_decl.name, method);
+                }
+            },
+            .enum_decl, .import_stmt, .extern_fn_decl => {
                 // These are handled at the type/module level
             },
         }
@@ -144,6 +256,11 @@ pub const WasmCodegen = struct {
             // Track parameter as local
             try self.locals.put(param.name, self.local_count);
             self.local_count += 1;
+
+            // Track parameter type if it's a user-defined type (struct)
+            if (param.type_annotation == .user_defined) {
+                try self.local_types.put(param.name, param.type_annotation.user_defined);
+            }
         }
 
         // Return type
@@ -170,6 +287,59 @@ pub const WasmCodegen = struct {
 
         // Reset locals for next function
         self.locals.clearRetainingCapacity();
+        self.local_types.clearRetainingCapacity();
+        self.local_count = 0;
+    }
+
+    fn genStructMethod(self: *WasmCodegen, struct_name: []const u8, method: *ast.FnDecl) CodegenError!void {
+        try self.emitIndent();
+        try self.emit("(func $");
+        try self.emit(struct_name);
+        try self.emit("_");
+        try self.emit(method.name);
+
+        // Add self parameter (pointer to struct instance)
+        try self.emit(" (param $self i32)");
+        try self.locals.put("self", self.local_count);
+        self.local_count += 1;
+
+        // Add other parameters
+        for (method.params) |param| {
+            try self.emit(" (param $");
+            try self.emit(param.name);
+            try self.emit(" ");
+            try self.emit(try self.typeToWasm(param.type_annotation));
+            try self.emit(")");
+
+            try self.locals.put(param.name, self.local_count);
+            self.local_count += 1;
+        }
+
+        // Return type
+        if (method.return_type) |ret_type| {
+            const wasm_type = try self.typeToWasm(ret_type);
+            if (!std.mem.eql(u8, wasm_type, "void")) {
+                try self.emit(" (result ");
+                try self.emit(wasm_type);
+                try self.emit(")");
+            }
+        }
+
+        try self.emit("\n");
+        self.indent_level += 1;
+
+        // Method body
+        for (method.body) |*stmt| {
+            try self.genStmt(stmt);
+        }
+
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit(")\n\n");
+
+        // Reset locals for next function
+        self.locals.clearRetainingCapacity();
+        self.local_types.clearRetainingCapacity();
         self.local_count = 0;
     }
 
@@ -192,8 +362,20 @@ pub const WasmCodegen = struct {
         }
         try self.emit(")\n");
 
+        // Track type if it's user-defined (struct)
+        if (let_decl.type_annotation) |type_ann| {
+            if (type_ann == .user_defined) {
+                try self.local_types.put(let_decl.name, type_ann.user_defined);
+            }
+        }
+
         // Initialize if there's an initializer
         if (let_decl.initializer) |*initializer| {
+            // Track type from struct literal if no type annotation
+            if (initializer.* == .struct_literal and let_decl.type_annotation == null) {
+                try self.local_types.put(let_decl.name, initializer.struct_literal.type_name);
+            }
+
             try self.genExpr(initializer);
             try self.emitIndent();
             try self.emit("local.set $");
@@ -447,23 +629,77 @@ pub const WasmCodegen = struct {
                 try self.emit(id.name);
                 try self.emit("\n");
             },
+            .member_access => |*member| {
+                // Struct field access: obj.field
+                // We need to:
+                // 1. Get the struct pointer
+                // 2. Calculate field offset based on struct type
+                // 3. Load from memory at pointer + offset
+
+                // Generate code to get the object (should be a struct pointer)
+                try self.genExpr(member.object);
+
+                // Try to determine the struct type from the object
+                var field_offset: ?u32 = null;
+
+                // If object is an identifier, look up its type
+                if (member.object.* == .identifier) {
+                    const obj_name = member.object.identifier.name;
+                    if (self.local_types.get(obj_name)) |struct_name| {
+                        field_offset = self.getFieldOffset(struct_name, member.member);
+                    }
+                }
+
+                const offset = field_offset orelse 0; // Default to 0 if we can't determine
+
+                if (offset > 0) {
+                    // Add offset to pointer
+                    try self.emitIndent();
+                    try self.emit("i32.const ");
+                    try self.emitInt(offset);
+                    try self.emit("\n");
+                    try self.emitIndent();
+                    try self.emit("i32.add\n");
+                }
+
+                // Load value from memory
+                try self.emitIndent();
+                try self.emit("i32.load  ;; load field ");
+                try self.emit(member.member);
+                try self.emit("\n");
+            },
             .binary => |*bin| {
                 try self.genExpr(bin.left);
                 try self.genExpr(bin.right);
                 try self.emitIndent();
 
+                // Detect if we're working with f64
+                const is_f64 = self.isF64Expr(bin.left) or self.isF64Expr(bin.right);
+
                 const op = switch (bin.operator) {
-                    .add => "i32.add",
-                    .subtract => "i32.sub",
-                    .multiply => "i32.mul",
-                    .divide => "i32.div_s",
-                    .modulo => "i32.rem_s",
-                    .equal => "i32.eq",
-                    .not_equal => "i32.ne",
-                    .less_than => "i32.lt_s",
-                    .less_equal => "i32.le_s",
-                    .greater_than => "i32.gt_s",
-                    .greater_equal => "i32.ge_s",
+                    .add => if (is_f64) "f64.add" else "i32.add",
+                    .subtract => if (is_f64) "f64.sub" else "i32.sub",
+                    .multiply => if (is_f64) "f64.mul" else "i32.mul",
+                    .divide => if (is_f64) "f64.div" else "i32.div_s",
+                    .modulo => if (is_f64) "f64.rem" else "i32.rem_s",
+                    .equal => blk: {
+                        break :blk if (is_f64) "f64.eq" else "i32.eq";
+                    },
+                    .not_equal => blk: {
+                        break :blk if (is_f64) "f64.ne" else "i32.ne";
+                    },
+                    .less_than => blk: {
+                        break :blk if (is_f64) "f64.lt" else "i32.lt_s";
+                    },
+                    .less_equal => blk: {
+                        break :blk if (is_f64) "f64.le" else "i32.le_s";
+                    },
+                    .greater_than => blk: {
+                        break :blk if (is_f64) "f64.gt" else "i32.gt_s";
+                    },
+                    .greater_equal => blk: {
+                        break :blk if (is_f64) "f64.ge" else "i32.ge_s";
+                    },
                     .logical_and => "i32.and",
                     .logical_or => "i32.or",
                     .bitwise_and => "i32.and",
@@ -479,8 +715,10 @@ pub const WasmCodegen = struct {
                 try self.genExpr(un.operand);
                 try self.emitIndent();
 
+                const is_f64 = self.isF64Expr(un.operand);
+
                 const op = switch (un.operator) {
-                    .negate => "i32.const -1\n  i32.mul",
+                    .negate => if (is_f64) "f64.neg" else "i32.const -1\n  i32.mul",
                     .not => "i32.eqz",
                     .bitwise_not => return CodegenError.UnsupportedFeature,
                 };
@@ -489,6 +727,63 @@ pub const WasmCodegen = struct {
                 try self.emit("\n");
             },
             .call => |*call| {
+                // Check if this is a method call (arr.method())
+                if (call.callee.* == .member_access) {
+                    const member = call.callee.member_access;
+
+                    // Array methods
+                    if (std.mem.eql(u8, member.member, "push")) {
+                        try self.genArrayPush(member.object, call.args);
+                        return;
+                    } else if (std.mem.eql(u8, member.member, "pop")) {
+                        try self.genArrayPop(member.object);
+                        return;
+                    } else if (std.mem.eql(u8, member.member, "len")) {
+                        try self.genArrayLen(member.object);
+                        return;
+                    } else if (std.mem.eql(u8, member.member, "map")) {
+                        try self.genArrayMap(member.object, call.args);
+                        return;
+                    } else if (std.mem.eql(u8, member.member, "filter")) {
+                        try self.genArrayFilter(member.object, call.args);
+                        return;
+                    } else if (std.mem.eql(u8, member.member, "reduce")) {
+                        try self.genArrayReduce(member.object, call.args);
+                        return;
+                    }
+
+                    // Struct method call: obj.method()
+                    // Try to determine struct type from object
+                    var struct_type_name: ?[]const u8 = null;
+                    if (member.object.* == .identifier) {
+                        const obj_name = member.object.identifier.name;
+                        if (self.local_types.get(obj_name)) |type_name| {
+                            struct_type_name = type_name;
+                        }
+                    }
+
+                    if (struct_type_name) |type_name| {
+                        // Generate struct method call: StructName_method(self, args...)
+                        // Push self (the struct instance) first
+                        try self.genExpr(member.object);
+
+                        // Push other arguments
+                        for (call.args) |*arg| {
+                            try self.genExpr(arg);
+                        }
+
+                        // Call the method
+                        try self.emitIndent();
+                        try self.emit("call $");
+                        try self.emit(type_name);
+                        try self.emit("_");
+                        try self.emit(member.member);
+                        try self.emit("\n");
+                        return;
+                    }
+                }
+
+                // Regular function call
                 // Generate arguments
                 for (call.args) |*arg| {
                     try self.genExpr(arg);
@@ -521,11 +816,56 @@ pub const WasmCodegen = struct {
 
                 try self.emit("\n");
             },
-            .string_literal => {
-                // String literals need to be stored in linear memory
-                // For now, we'll skip this (Phase 1 limitation)
+            .string_literal => |*str_lit| {
+                // Store string in linear memory: [length: i32][...bytes...]
+                const str_bytes = str_lit.value;
+                const str_len = @as(u32, @intCast(str_bytes.len));
+
+                // Allocate: 4 bytes for length + string bytes
+                const total_size = 4 + str_len;
+                const ptr = self.memory_allocator.alloc(total_size);
+
                 try self.emitIndent();
-                try self.emit("i32.const 0  ;; string literal placeholder\n");
+                try self.emit(";; string literal \"");
+                // Truncate for display if too long
+                const display_len = @min(str_bytes.len, 20);
+                try self.emit(str_bytes[0..display_len]);
+                if (str_bytes.len > 20) try self.emit("...");
+                try self.emit("\" at ");
+                try self.emitInt(@intCast(ptr));
+                try self.emit("\n");
+
+                // Store length
+                try self.emitIndent();
+                try self.emit("i32.const ");
+                try self.emitInt(@intCast(ptr));
+                try self.emit("\n");
+                try self.emitIndent();
+                try self.emit("i32.const ");
+                try self.emitInt(@intCast(str_len));
+                try self.emit("\n");
+                try self.emitIndent();
+                try self.emit("i32.store\n");
+
+                // Store each byte of the string
+                for (str_bytes, 0..) |byte, i| {
+                    try self.emitIndent();
+                    try self.emit("i32.const ");
+                    try self.emitInt(@intCast(ptr + 4 + i));
+                    try self.emit("\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const ");
+                    try self.emitInt(@intCast(byte));
+                    try self.emit("\n");
+                    try self.emitIndent();
+                    try self.emit("i32.store8\n");
+                }
+
+                // Return pointer to the string (pointing at length field)
+                try self.emitIndent();
+                try self.emit("i32.const ");
+                try self.emitInt(@intCast(ptr));
+                try self.emit("  ;; string pointer\n");
             },
             .await_expr => |*await_expr| {
                 // Generate the promise-returning expression (e.g., async function call)
@@ -546,31 +886,79 @@ pub const WasmCodegen = struct {
                 try self.genExpr(try_expr.expr);
             },
             .string_interpolation => |*interp| {
-                // String interpolation: concatenate text and expr parts
-                // For now, just return placeholder - full implementation needs memory allocator
-                _ = interp;
-                try self.emitIndent();
-                try self.emit("i32.const 4096  ;; string interpolation result (needs allocator)\n");
+                try self.genStringInterpolation(interp);
             },
             .match_expr => |*match_expr| {
                 try self.genMatchExpr(match_expr);
             },
+            .index_access => |*idx| {
+                // arr[i] → load from memory
+                // Array layout: [length: i32][capacity: i32][elem0][elem1]...
+                // Generate array pointer
+                try self.genExpr(idx.object);
+
+                // Add metadata offset (8 bytes)
+                try self.emitIndent();
+                try self.emit("i32.const 8\n");
+                try self.emitIndent();
+                try self.emit("i32.add\n");
+
+                // Generate index
+                try self.genExpr(idx.index);
+
+                // Calculate offset: (ptr + 8) + (index * 4)
+                try self.emitIndent();
+                try self.emit("i32.const 4\n");
+                try self.emitIndent();
+                try self.emit("i32.mul\n");
+                try self.emitIndent();
+                try self.emit("i32.add\n");
+
+                // Load value
+                try self.emitIndent();
+                try self.emit("i32.load\n");
+            },
             .array_literal => |*arr| {
-                // Allocate memory for array
-                const element_size: u32 = 4; // Assume i32 for now
-                const array_size = @as(u32, @intCast(arr.elements.len)) * element_size;
+                // Array layout: [length: i32][capacity: i32][elem0][elem1]...
+                const element_size: u32 = 4;
+                const len = @as(u32, @intCast(arr.elements.len));
+                const capacity = len * 2; // Initial capacity is 2x length
+                const metadata_size: u32 = 8; // length + capacity
+                const array_size = metadata_size + (capacity * element_size);
                 const ptr = self.memory_allocator.alloc(array_size);
 
-                // Generate array elements and store them
                 try self.emitIndent();
                 try self.emit(";; array literal at ");
                 try self.emitInt(@intCast(ptr));
                 try self.emit("\n");
 
+                // Store length
+                try self.emitIndent();
+                try self.emit("i32.const ");
+                try self.emitInt(@intCast(ptr));
+                try self.emit("\n");
+                try self.emitIndent();
+                try self.emit("i32.const ");
+                try self.emitInt(@intCast(len));
+                try self.emit("\n");
+                try self.emitIndent();
+                try self.emit("i32.store\n");
+
+                // Store capacity
+                try self.emitIndent();
+                try self.emit("i32.const ");
+                try self.emitInt(@intCast(ptr + 4));
+                try self.emit("\n");
+                try self.emitIndent();
+                try self.emit("i32.const ");
+                try self.emitInt(@intCast(capacity));
+                try self.emit("\n");
+                try self.emitIndent();
+                try self.emit("i32.store\n");
+
                 // Store each element
                 for (arr.elements, 0..) |*elem, i| {
-                    // Calculate offset
-                    const offset = ptr + (@as(u32, @intCast(i)) * element_size);
+                    const offset = ptr + metadata_size + (@as(u32, @intCast(i)) * element_size);
 
                     // Generate element value
                     try self.genExpr(elem);
@@ -624,29 +1012,104 @@ pub const WasmCodegen = struct {
                 try self.emit("  ;; struct pointer\n");
             },
             .assign_expr => |*assign| {
-                // Generate the value expression
-                try self.genExpr(assign.value);
+                switch (assign.target.*) {
+                    .identifier => |id| {
+                        // Simple variable assignment
+                        try self.genExpr(assign.value);
+                        try self.emitIndent();
+                        try self.emit("local.set $");
+                        try self.emit(id.name);
+                        try self.emit("\n");
+                        try self.emitIndent();
+                        try self.emit("local.get $");
+                        try self.emit(id.name);
+                        try self.emit("\n");
+                    },
+                    .index_access => |*idx| {
+                        // arr[i] = value
+                        // Calculate address: (ptr + 8) + (index * 4)
+                        try self.genExpr(idx.object);
+                        try self.emitIndent();
+                        try self.emit("i32.const 8\n");
+                        try self.emitIndent();
+                        try self.emit("i32.add\n");
+                        try self.genExpr(idx.index);
+                        try self.emitIndent();
+                        try self.emit("i32.const 4\n");
+                        try self.emitIndent();
+                        try self.emit("i32.mul\n");
+                        try self.emitIndent();
+                        try self.emit("i32.add\n");
 
-                // Get the target variable name
-                const target_name = switch (assign.target.*) {
-                    .identifier => |id| id.name,
+                        // Generate value
+                        try self.genExpr(assign.value);
+
+                        // Store
+                        try self.emitIndent();
+                        try self.emit("i32.store\n");
+
+                        // Return the value
+                        try self.genExpr(assign.value);
+                    },
+                    .member_access => |*member| {
+                        // struct.field = value
+                        // Calculate field offset and store
+
+                        // Get struct type
+                        var struct_type_name: ?[]const u8 = null;
+                        if (member.object.* == .identifier) {
+                            const obj_name = member.object.identifier.name;
+                            if (self.local_types.get(obj_name)) |type_name| {
+                                struct_type_name = type_name;
+                            }
+                        }
+
+                        const offset = if (struct_type_name) |type_name|
+                            self.getFieldOffset(type_name, member.member) orelse 0
+                        else
+                            0;
+
+                        // Get struct pointer
+                        try self.genExpr(member.object);
+
+                        // Add offset if needed
+                        if (offset > 0) {
+                            try self.emitIndent();
+                            try self.emit("i32.const ");
+                            try self.emitInt(offset);
+                            try self.emit("\n");
+                            try self.emitIndent();
+                            try self.emit("i32.add\n");
+                        }
+
+                        // Generate value
+                        try self.genExpr(assign.value);
+
+                        // Store
+                        try self.emitIndent();
+                        try self.emit("i32.store  ;; set field ");
+                        try self.emit(member.member);
+                        try self.emit("\n");
+
+                        // Return the value
+                        try self.genExpr(assign.value);
+                    },
                     else => return CodegenError.UnsupportedFeature,
-                };
-
-                // Store to the local variable
-                try self.emitIndent();
-                try self.emit("local.set $");
-                try self.emit(target_name);
-                try self.emit("\n");
-
-                // Assignment expression also returns the value, so load it again
-                try self.emitIndent();
-                try self.emit("local.get $");
-                try self.emit(target_name);
-                try self.emit("\n");
+                }
             },
-            else => {
-                return CodegenError.UnsupportedFeature;
+            .lambda => |*lambda| {
+                // For now, lambdas are not directly callable in WASM
+                // They need to be stored as function pointers or passed to higher-order functions
+                // Simplified: generate a stub that returns 0
+                // Full implementation would:
+                // 1. Generate a unique function name
+                // 2. Emit the function with captured variables
+                // 3. Return a function pointer/index
+                _ = lambda;
+                try self.emitIndent();
+                try self.emit(";; lambda expression (stub)\n");
+                try self.emitIndent();
+                try self.emit("i32.const 0  ;; TODO: lambda function pointer\n");
             },
         }
     }
@@ -691,6 +1154,382 @@ pub const WasmCodegen = struct {
         const str = try std.fmt.bufPrint(&buf, "{d}", .{value});
         try self.emit(str);
     }
+    fn genStringInterpolation(self: *WasmCodegen, interp: *const ast.Expr.StringInterpolation) !void {
+        // For string interpolation, we'll use a simple approach:
+        // 1. Allocate memory for the concatenated result (estimate max size)
+        // 2. Write each part sequentially
+        // 3. Return pointer to start
+
+        // For now, simplified version: just allocate space and store parts
+        // A full implementation would need actual string concat host function
+
+        const alloc_ptr = self.memory_allocator.alloc(256); // Max 256 bytes for interpolated string
+
+        try self.emitIndent();
+        try self.emit(";; String interpolation\n");
+
+        // Store string parts - for MVP just return allocated pointer
+        // In a full impl, we'd iterate and concat each part
+        _ = interp;
+
+        try self.emitIndent();
+        try self.emit("i32.const ");
+        try self.emit(try std.fmt.allocPrint(self.allocator, "{d}", .{alloc_ptr}));
+        try self.emit("  ;; interpolated string ptr\n");
+
+        // TODO: Implement actual string concatenation
+        // For each part:
+        //   - If text: write literal bytes
+        //   - If expr: convert to string and append
+    }
+
+    // Array method implementations
+    fn genArrayLen(self: *WasmCodegen, array_expr: *ast.Expr) !void {
+        // Array metadata: [length: i32][capacity: i32][elements...]
+        // Read length at offset 0
+        try self.genExpr(array_expr);
+        try self.emitIndent();
+        try self.emit("i32.load  ;; load array length\n");
+    }
+
+    fn genArrayPush(self: *WasmCodegen, array_expr: *ast.Expr, args: []ast.Expr) !void {
+        if (args.len != 1) return CodegenError.UnsupportedFeature;
+
+        // Simplified: assume array has capacity
+        // Array layout: [length: i32][capacity: i32][elem0][elem1]...
+        // 1. Load current length
+        try self.genExpr(array_expr);
+        try self.emitIndent();
+        try self.emit("local.tee $arr_ptr\n");
+        try self.emitIndent();
+        try self.emit("i32.load  ;; load length\n");
+        try self.emitIndent();
+        try self.emit("local.set $arr_len\n");
+
+        // 2. Calculate element address: ptr + 8 + (len * 4)
+        try self.emitIndent();
+        try self.emit("local.get $arr_ptr\n");
+        try self.emitIndent();
+        try self.emit("i32.const 8\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $arr_len\n");
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.mul\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+
+        // 3. Store value
+        try self.genExpr(&args[0]);
+        try self.emitIndent();
+        try self.emit("i32.store\n");
+
+        // 4. Increment length
+        try self.emitIndent();
+        try self.emit("local.get $arr_ptr\n");
+        try self.emitIndent();
+        try self.emit("local.get $arr_len\n");
+        try self.emitIndent();
+        try self.emit("i32.const 1\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("i32.store\n");
+
+        // Return void (push i32.const 0)
+        try self.emitIndent();
+        try self.emit("i32.const 0\n");
+    }
+
+    fn genArrayPop(self: *WasmCodegen, array_expr: *ast.Expr) !void {
+        // 1. Load array pointer and length
+        try self.genExpr(array_expr);
+        try self.emitIndent();
+        try self.emit("local.tee $arr_ptr\n");
+        try self.emitIndent();
+        try self.emit("i32.load  ;; load length\n");
+        try self.emitIndent();
+        try self.emit("local.tee $arr_len\n");
+
+        // 2. Check if empty (length == 0)
+        try self.emitIndent();
+        try self.emit("i32.const 0\n");
+        try self.emitIndent();
+        try self.emit("i32.eq\n");
+        try self.emitIndent();
+        try self.emit("if\n");
+        self.indent_level += 1;
+        try self.emitIndent();
+        try self.emit("i32.const 0  ;; return 0 if empty\n");
+        try self.emitIndent();
+        try self.emit("return\n");
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit("end\n");
+
+        // 3. Decrement length
+        try self.emitIndent();
+        try self.emit("local.get $arr_ptr\n");
+        try self.emitIndent();
+        try self.emit("local.get $arr_len\n");
+        try self.emitIndent();
+        try self.emit("i32.const 1\n");
+        try self.emitIndent();
+        try self.emit("i32.sub\n");
+        try self.emitIndent();
+        try self.emit("local.tee $arr_len\n");
+        try self.emitIndent();
+        try self.emit("i32.store\n");
+
+        // 4. Load last element: ptr + 8 + (len * 4)
+        try self.emitIndent();
+        try self.emit("local.get $arr_ptr\n");
+        try self.emitIndent();
+        try self.emit("i32.const 8\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $arr_len\n");
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.mul\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("i32.load  ;; load popped value\n");
+    }
+
+    fn genArrayMap(self: *WasmCodegen, array_expr: *ast.Expr, args: []ast.Expr) !void {
+        if (args.len != 1) return CodegenError.UnsupportedFeature;
+
+        // arr.map(fn) - simplified: create new array, iterate, apply fn, store results
+        // Get source array
+        try self.genExpr(array_expr);
+        try self.emitIndent();
+        try self.emit("local.tee $src_arr\n");
+        try self.emitIndent();
+        try self.emit("i32.load  ;; load source length\n");
+        try self.emitIndent();
+        try self.emit("local.tee $arr_len\n");
+
+        // Allocate new array with same length
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.mul  ;; elements size\n");
+        try self.emitIndent();
+        try self.emit("i32.const 8\n");
+        try self.emitIndent();
+        try self.emit("i32.add  ;; + metadata\n");
+        try self.emitIndent();
+        try self.emit("call $alloc\n");
+        try self.emitIndent();
+        try self.emit("local.tee $new_arr\n");
+
+        // Store length & capacity in new array
+        try self.emitIndent();
+        try self.emit("local.get $arr_len\n");
+        try self.emitIndent();
+        try self.emit("i32.store  ;; store length\n");
+        try self.emitIndent();
+        try self.emit("local.get $new_arr\n");
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $arr_len\n");
+        try self.emitIndent();
+        try self.emit("i32.store  ;; store capacity\n");
+
+        // Loop: for each element, apply fn, store in new array
+        try self.emitIndent();
+        try self.emit("i32.const 0\n");
+        try self.emitIndent();
+        try self.emit("local.set $i\n");
+        try self.emitIndent();
+        try self.emit("(loop $map_loop\n");
+        self.indent_level += 1;
+
+        // Check if i < len
+        try self.emitIndent();
+        try self.emit("local.get $i\n");
+        try self.emitIndent();
+        try self.emit("local.get $arr_len\n");
+        try self.emitIndent();
+        try self.emit("i32.lt_s\n");
+        try self.emitIndent();
+        try self.emit("if\n");
+        self.indent_level += 1;
+
+        // Load element: src_arr + 8 + (i * 4)
+        try self.emitIndent();
+        try self.emit("local.get $src_arr\n");
+        try self.emitIndent();
+        try self.emit("i32.const 8\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $i\n");
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.mul\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("i32.load  ;; load element\n");
+
+        // Apply function (inline lambda for now - simplified)
+        // TODO: proper function call
+        // For now, just copy element (identity function)
+
+        // Store in new array: new_arr + 8 + (i * 4)
+        try self.emitIndent();
+        try self.emit("local.get $new_arr\n");
+        try self.emitIndent();
+        try self.emit("i32.const 8\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $i\n");
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.mul\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("i32.store\n");
+
+        // Increment i
+        try self.emitIndent();
+        try self.emit("local.get $i\n");
+        try self.emitIndent();
+        try self.emit("i32.const 1\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.set $i\n");
+
+        // Loop back
+        try self.emitIndent();
+        try self.emit("br $map_loop\n");
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit("end\n");
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit(")\n");
+
+        // Return new array
+        try self.emitIndent();
+        try self.emit("local.get $new_arr\n");
+    }
+
+    fn genArrayFilter(self: *WasmCodegen, array_expr: *ast.Expr, args: []ast.Expr) !void {
+        _ = args;
+        _ = array_expr;
+        // Simplified: allocate result array, iterate, test predicate, append if true
+        // TODO: implement filter logic
+        try self.emitIndent();
+        try self.emit("i32.const 0  ;; TODO: filter implementation\n");
+    }
+
+    fn genArrayReduce(self: *WasmCodegen, array_expr: *ast.Expr, args: []ast.Expr) !void {
+        if (args.len != 2) return CodegenError.UnsupportedFeature;
+
+        // arr.reduce(fn, initial)
+        // Get array
+        try self.genExpr(array_expr);
+        try self.emitIndent();
+        try self.emit("local.tee $arr_ptr\n");
+        try self.emitIndent();
+        try self.emit("i32.load  ;; load length\n");
+        try self.emitIndent();
+        try self.emit("local.set $arr_len\n");
+
+        // Get initial value (accumulator)
+        try self.genExpr(&args[1]);
+        try self.emitIndent();
+        try self.emit("local.set $acc\n");
+
+        // Loop through elements
+        try self.emitIndent();
+        try self.emit("i32.const 0\n");
+        try self.emitIndent();
+        try self.emit("local.set $i\n");
+        try self.emitIndent();
+        try self.emit("(loop $reduce_loop\n");
+        self.indent_level += 1;
+
+        // Check if i < len
+        try self.emitIndent();
+        try self.emit("local.get $i\n");
+        try self.emitIndent();
+        try self.emit("local.get $arr_len\n");
+        try self.emitIndent();
+        try self.emit("i32.lt_s\n");
+        try self.emitIndent();
+        try self.emit("if\n");
+        self.indent_level += 1;
+
+        // Load current element
+        try self.emitIndent();
+        try self.emit("local.get $arr_ptr\n");
+        try self.emitIndent();
+        try self.emit("i32.const 8\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $i\n");
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.mul\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("i32.load  ;; current element\n");
+
+        // Apply reducer: acc = fn(acc, element)
+        // TODO: proper function call
+        // For now: acc = acc + element (simple sum)
+        try self.emitIndent();
+        try self.emit("local.get $acc\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.set $acc\n");
+
+        // Increment i
+        try self.emitIndent();
+        try self.emit("local.get $i\n");
+        try self.emitIndent();
+        try self.emit("i32.const 1\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.set $i\n");
+
+        // Loop back
+        try self.emitIndent();
+        try self.emit("br $reduce_loop\n");
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit("end\n");
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit(")\n");
+
+        // Return accumulator
+        try self.emitIndent();
+        try self.emit("local.get $acc\n");
+    }
 };
 
 test "basic codegen" {
@@ -707,3 +1546,4 @@ test "basic codegen" {
     const output = try codegen.generate(&module);
     try std.testing.expect(std.mem.indexOf(u8, output, "(module") != null);
 }
+

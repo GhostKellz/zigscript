@@ -8,19 +8,42 @@
   (import "nexus" "set_timeout" (func $nexus_set_timeout (param i32) (result i32)))
   (import "nexus" "promise_await" (func $nexus_promise_await (param i32) (result i32)))
 
-  (func $delay (param $ms i32) (result i32)
-    local.get $ms
+  (func $Counter_increment (param $self i32)
+    local.get $self
+    local.get $self
+    i32.load  ;; load field value
+    i32.const 1
+    i32.add
+    i32.store  ;; set field value
+    local.get $self
+    i32.load  ;; load field value
+    i32.const 1
+    i32.add
+  drop
+  )
+
+  (func $Counter_get (param $self i32) (result i32)
+    local.get $self
+    i32.load  ;; load field value
     return
   )
 
   (func $main (export "main") (result i32)
-    (local $result i32)
-    ;; await expression - evaluate promise
-    i32.const 1000
-    call $delay
-    call $nexus_promise_await
-    local.set $result
-    local.get $result
+    (local $counter i32)
+    ;; struct literal at 8192
+    i32.const 10
+    i32.const 8192
+    i32.store
+    i32.const 8192  ;; struct pointer
+    local.set $counter
+    local.get $counter
+    call $Counter_increment
+  drop
+    local.get $counter
+    call $Counter_increment
+  drop
+    local.get $counter
+    call $Counter_get
     return
   )
 

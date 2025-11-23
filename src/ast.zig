@@ -108,10 +108,7 @@ pub const Expr = union(enum) {
         expr: *Expr,
         loc: SourceLocation,
     },
-    string_interpolation: struct {
-        parts: []StringPart,
-        loc: SourceLocation,
-    },
+    string_interpolation: StringInterpolation,
     match_expr: struct {
         value: *Expr,
         arms: []MatchArm,
@@ -122,6 +119,17 @@ pub const Expr = union(enum) {
         value: *Expr,
         loc: SourceLocation,
     },
+    lambda: struct {
+        params: []FnParam,
+        return_type: ?Type,
+        body: LambdaBody,
+        loc: SourceLocation,
+    },
+
+    pub const LambdaBody = union(enum) {
+        expression: *Expr,  // fn(x) => x * 2
+        block: []Stmt,      // fn(x) { return x * 2; }
+    };
 
     pub const StructField = struct {
         name: []const u8,
@@ -131,6 +139,13 @@ pub const Expr = union(enum) {
     pub const StringPart = union(enum) {
         text: []const u8,
         expr: Expr,
+    };
+
+    pub const StringPartList = std.ArrayList(StringPart);
+
+    pub const StringInterpolation = struct {
+        parts: []StringPart,
+        loc: SourceLocation,
     };
 
     pub const MatchArm = struct {
@@ -255,6 +270,8 @@ pub const FnParam = struct {
 pub const StructDecl = struct {
     name: []const u8,
     fields: []StructField,
+    methods: []FnDecl,
+    is_export: bool,
     loc: SourceLocation,
 
     pub const StructField = struct {
@@ -266,6 +283,7 @@ pub const StructDecl = struct {
 pub const EnumDecl = struct {
     name: []const u8,
     variants: []EnumVariant,
+    is_export: bool,
     loc: SourceLocation,
 
     pub const EnumVariant = struct {

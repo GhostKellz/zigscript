@@ -22,7 +22,6 @@ pub const TokenType = enum {
     kw_import,
     kw_from,
     kw_export,
-    kw_extern,
     kw_match,
     kw_for,
     kw_in,
@@ -40,6 +39,7 @@ pub const TokenType = enum {
     kw_f64,
     kw_string,
     kw_bytes,
+    kw_self,
 
     // Operators
     plus,
@@ -255,7 +255,6 @@ pub const Lexer = struct {
             .{ "import", .kw_import },
             .{ "from", .kw_from },
             .{ "export", .kw_export },
-            .{ "extern", .kw_extern },
             .{ "match", .kw_match },
             .{ "for", .kw_for },
             .{ "in", .kw_in },
@@ -273,6 +272,7 @@ pub const Lexer = struct {
             .{ "f64", .kw_f64 },
             .{ "string", .kw_string },
             .{ "bytes", .kw_bytes },
+            .{ "self", .kw_self },
         });
         return keywords.get(lexeme) orelse .identifier;
     }

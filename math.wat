@@ -8,8 +8,17 @@
   (import "nexus" "set_timeout" (func $nexus_set_timeout (param i32) (result i32)))
   (import "nexus" "promise_await" (func $nexus_promise_await (param i32) (result i32)))
 
-  (func $main (export "main") (result i32)
-    i32.const 42
+  (func $add (export "add") (param $a i32) (param $b i32) (result i32)
+    local.get $a
+    local.get $b
+    i32.add
+    return
+  )
+
+  (func $multiply (export "multiply") (param $a i32) (param $b i32) (result i32)
+    local.get $a
+    local.get $b
+    i32.mul
     return
   )
 

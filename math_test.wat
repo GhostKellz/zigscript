@@ -9,7 +9,38 @@
   (import "nexus" "promise_await" (func $nexus_promise_await (param i32) (result i32)))
 
   (func $main (export "main") (result i32)
-    i32.const 42
+    (local $a i32)
+    i32.const 10
+    local.set $a
+    (local $b i32)
+    i32.const 20
+    local.set $b
+    (local $sum i32)
+    local.get $a
+    local.get $b
+    i32.add
+    local.set $sum
+    (local $product i32)
+    f64.const 3.14
+    f64.const 2
+    f64.mul
+    local.set $product
+    (local $diff i32)
+    f64.const 10.5
+    f64.const 3.2
+    f64.sub
+    local.set $diff
+    (local $quotient i32)
+    f64.const 8
+    f64.const 2
+    f64.div
+    local.set $quotient
+    (local $is_greater i32)
+    f64.const 5.5
+    f64.const 3.3
+    f64.gt
+    local.set $is_greater
+    local.get $sum
     return
   )
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const ast = @import("ast.zig");
+const module_resolver = @import("module_resolver.zig");
 
 pub const TypeError = error{
     TypeMismatch,
@@ -84,6 +85,71 @@ pub const TypeChecker = struct {
         }
     }
 
+    pub fn checkModuleWithImports(self: *TypeChecker, module: *ast.Module, resolver: *module_resolver.ModuleResolver) !void {
+        // First pass: Process import statements and add exported symbols to our tables
+        for (module.stmts) |stmt| {
+            if (stmt == .import_stmt) {
+                const import_stmt = stmt.import_stmt;
+
+                // Find the loaded module by searching for paths that end with the import name
+                var module_iter = resolver.modules.iterator();
+                var loaded_module: ?*module_resolver.Module = null;
+
+                const search_patterns = [_][]const u8{
+                    import_stmt.from,
+                    try std.fmt.allocPrint(self.allocator, "{s}.zs", .{import_stmt.from}),
+                    try std.fmt.allocPrint(self.allocator, "examples/{s}", .{import_stmt.from}),
+                    try std.fmt.allocPrint(self.allocator, "examples/{s}.zs", .{import_stmt.from}),
+                };
+
+                while (module_iter.next()) |entry| {
+                    // Check if the path ends with any of our search patterns
+                    for (search_patterns) |pattern| {
+                        if (std.mem.endsWith(u8, entry.key_ptr.*, pattern)) {
+                            loaded_module = entry.value_ptr;
+                            break;
+                        }
+                    }
+                    if (loaded_module != null) break;
+                }
+
+                if (loaded_module) |mod| {
+                    // Process each imported item
+                    for (import_stmt.imports) |item| {
+                        // Look up the symbol in the module's exports
+                        if (mod.exports.get(item.name)) |export_item| {
+                            switch (export_item) {
+                                .function => |fn_decl| {
+                                    // Add the function to our function table
+                                    try self.functions.put(fn_decl.name, FunctionSignature{
+                                        .params = fn_decl.params,
+                                        .return_type = fn_decl.return_type,
+                                        .is_async = fn_decl.is_async,
+                                    });
+                                },
+                                .struct_type => |struct_decl| {
+                                    // Add the struct type to our types table
+                                    try self.types.put(struct_decl.name, ast.Type{ .user_defined = struct_decl.name });
+                                },
+                                .enum_type => |enum_decl| {
+                                    // Add the enum type to our types table
+                                    try self.types.put(enum_decl.name, ast.Type{ .user_defined = enum_decl.name });
+                                },
+                            }
+                        } else {
+                            std.debug.print("Warning: Symbol '{s}' not found in module '{s}'\n", .{ item.name, import_stmt.from });
+                        }
+                    }
+                } else {
+                    std.debug.print("Warning: Module '{s}' not loaded\n", .{import_stmt.from});
+                }
+            }
+        }
+
+        // Then do normal type checking
+        try self.checkModule(module);
+    }
+
     fn checkStmt(self: *TypeChecker, stmt: *ast.Stmt) TypeError!void {
         switch (stmt.*) {
             .fn_decl => |*fn_decl| {
@@ -114,8 +180,8 @@ pub const TypeChecker = struct {
             .expr_stmt => |*expr_stmt| {
                 _ = try self.checkExpr(&expr_stmt.expr);
             },
-            .import_stmt => {
-                // TODO: Handle imports
+            .import_stmt, .extern_fn_decl => {
+                // TODO: Handle imports and extern functions
             },
             .for_stmt => |*for_stmt| {
                 // Type check the iterable
@@ -508,35 +574,93 @@ pub const TypeChecker = struct {
             },
 
             .assign_expr => |*assign| blk: {
-                // Get the target variable name (must be identifier)
-                const target_name = switch (assign.target.*) {
-                    .identifier => |id| id.name,
+                // Type check based on target type
+                const target_type = switch (assign.target.*) {
+                    .identifier => |id| blk2: {
+                        // Look up existing variable
+                        const var_info = try self.lookupVariable(id.name);
+
+                        // Check if variable is mutable
+                        if (!var_info.is_mutable) {
+                            std.debug.print("Cannot assign to const variable: {s}\n", .{id.name});
+                            return TypeError.InvalidOperation;
+                        }
+                        break :blk2 var_info.type_def;
+                    },
+                    .index_access => |*idx| blk2: {
+                        // arr[i] = value
+                        const arr_type = try self.checkExpr(idx.object);
+                        const index_type = try self.checkExpr(idx.index);
+
+                        // Verify index is i32
+                        if (!try self.typesMatch(index_type, ast.Type{ .primitive = .i32 })) {
+                            std.debug.print("Array index must be i32\n", .{});
+                            return TypeError.TypeMismatch;
+                        }
+
+                        // Extract element type from array
+                        const elem_type = switch (arr_type) {
+                            .array => |*elem_ptr| elem_ptr.*,
+                            else => {
+                                std.debug.print("Index access requires array type\n", .{});
+                                return TypeError.TypeMismatch;
+                            },
+                        };
+                        break :blk2 elem_type.*;
+                    },
                     else => {
-                        std.debug.print("Assignment target must be an identifier\n", .{});
+                        std.debug.print("Invalid assignment target\n", .{});
                         return TypeError.InvalidOperation;
                     },
                 };
-
-                // Look up existing variable
-                const var_info = try self.lookupVariable(target_name);
-
-                // Check if variable is mutable
-                if (!var_info.is_mutable) {
-                    std.debug.print("Cannot assign to const variable: {s}\n", .{target_name});
-                    return TypeError.InvalidOperation;
-                }
 
                 // Type check the value
                 const value_type = try self.checkExpr(assign.value);
 
                 // Ensure types match
-                if (!try self.typesMatch(var_info.type_def, value_type)) {
-                    std.debug.print("Assignment type mismatch for variable: {s}\n", .{target_name});
+                if (!try self.typesMatch(target_type, value_type)) {
+                    std.debug.print("Assignment type mismatch\n", .{});
                     return TypeError.TypeMismatch;
                 }
 
                 // Assignment expression returns the assigned value's type
                 break :blk value_type;
+            },
+
+            .lambda => |*lambda| blk: {
+                // Create function type for lambda
+                var param_types = try self.arena.allocator().alloc(ast.Type, lambda.params.len);
+                for (lambda.params, 0..) |param, i| {
+                    param_types[i] = param.type_annotation;
+                }
+
+                // Determine return type from body
+                const return_type = if (lambda.return_type) |ret_type| blk2: {
+                    const ret_ptr = try self.arena.allocator().create(ast.Type);
+                    ret_ptr.* = ret_type;
+                    break :blk2 ret_ptr;
+                } else blk2: {
+                    // Infer return type from body
+                    const inferred = switch (lambda.body) {
+                        .expression => |expr_ptr| try self.checkExpr(expr_ptr),
+                        .block => |stmts| blk3: {
+                            // Check for return statements in block
+                            _ = stmts;
+                            break :blk3 ast.Type{ .primitive = .void };
+                        },
+                    };
+                    const ret_ptr = try self.arena.allocator().create(ast.Type);
+                    ret_ptr.* = inferred;
+                    break :blk2 ret_ptr;
+                };
+
+                break :blk ast.Type{
+                    .function = .{
+                        .params = param_types,
+                        .return_type = return_type,
+                        .is_async = false,
+                    },
+                };
             },
         };
     }

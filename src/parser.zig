@@ -56,11 +56,13 @@ pub const Parser = struct {
 
     fn parseStmt(self: *Parser) !ast.Stmt {
         return switch (self.current_token.type) {
-            .kw_async => self.parseFnDecl(), // async fn
-            .kw_fn => self.parseFnDecl(),
+            .kw_export => self.parseExportDecl(),
+            .kw_async => self.parseFnDecl(false), // async fn (not exported)
+            .kw_fn => self.parseFnDecl(false),
             .kw_let, .kw_const => self.parseLetDecl(),
-            .kw_struct => self.parseStructDecl(),
-            .kw_enum => self.parseEnumDecl(),
+            .kw_struct => self.parseStructDecl(false),
+            .kw_enum => self.parseEnumDecl(false),
+            .kw_extern => self.parseExternFnDecl(),
             .kw_return => self.parseReturnStmt(),
             .kw_if => self.parseIfStmt(),
             .kw_while => self.parseWhileStmt(),
@@ -73,7 +75,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parseFnDecl(self: *Parser) !ast.Stmt {
+    fn parseFnDecl(self: *Parser, is_export: bool) !ast.Stmt {
         const loc = self.location();
 
         // Check for async keyword
@@ -121,7 +123,7 @@ pub const Parser = struct {
                 .return_type = return_type,
                 .body = body,
                 .is_async = is_async,
-                .is_export = false, // TODO: handle export keyword
+                .is_export = is_export,
                 .loc = loc,
             },
         };
@@ -157,22 +159,67 @@ pub const Parser = struct {
         };
     }
 
-    fn parseStructDecl(self: *Parser) !ast.Stmt {
+    fn parseStructDecl(self: *Parser, is_export: bool) !ast.Stmt {
         const loc = self.location();
         try self.consume(.kw_struct, "Expected 'struct'");
         const name = try self.consumeIdentifier("Expected struct name");
         try self.consume(.left_brace, "Expected '{' after struct name");
 
         var fields = std.ArrayList(ast.StructDecl.StructField).empty;
+        var methods = std.ArrayList(ast.FnDecl).empty;
 
         while (self.current_token.type != .right_brace and self.current_token.type != .eof) {
-            const field_name = try self.consumeIdentifier("Expected field name");
-            try self.consume(.colon, "Expected ':' after field name");
-            const field_type = try self.parseType();
+            // Check if this is a method (starts with 'fn')
+            if (self.current_token.type == .kw_fn) {
+                const method = try self.parseStructMethod();
+                try methods.append(self.ast_builder.arena.allocator(), method);
+            } else {
+                // It's a field
+                const field_name = try self.consumeIdentifier("Expected field name");
+                try self.consume(.colon, "Expected ':' after field name");
+                const field_type = try self.parseType();
 
-            try fields.append(self.ast_builder.arena.allocator(), .{
-                .name = field_name,
-                .type_annotation = field_type,
+                try fields.append(self.ast_builder.arena.allocator(), .{
+                    .name = field_name,
+                    .type_annotation = field_type,
+                });
+
+                if (self.current_token.type == .comma) {
+                    try self.advance();
+                }
+            }
+        }
+
+        try self.consume(.right_brace, "Expected '}' after struct body");
+
+        return ast.Stmt{
+            .struct_decl = .{
+                .name = name,
+                .fields = try fields.toOwnedSlice(self.ast_builder.arena.allocator()),
+                .methods = try methods.toOwnedSlice(self.ast_builder.arena.allocator()),
+                .is_export = is_export,
+                .loc = loc,
+            },
+        };
+    }
+
+    fn parseStructMethod(self: *Parser) !ast.FnDecl {
+        const loc = self.location();
+        try self.consume(.kw_fn, "Expected 'fn'");
+        const name = try self.consumeIdentifier("Expected method name");
+        try self.consume(.left_paren, "Expected '(' after method name");
+
+        var params = std.ArrayList(ast.FnParam).empty;
+
+        // Parse parameters (self is implicit, not in param list)
+        while (self.current_token.type != .right_paren and self.current_token.type != .eof) {
+            const param_name = try self.consumeIdentifier("Expected parameter name");
+            try self.consume(.colon, "Expected ':' after parameter name");
+            const param_type = try self.parseType();
+
+            try params.append(self.ast_builder.arena.allocator(), .{
+                .name = param_name,
+                .type_annotation = param_type,
             });
 
             if (self.current_token.type == .comma) {
@@ -180,18 +227,27 @@ pub const Parser = struct {
             }
         }
 
-        try self.consume(.right_brace, "Expected '}' after struct fields");
+        try self.consume(.right_paren, "Expected ')' after parameters");
 
-        return ast.Stmt{
-            .struct_decl = .{
-                .name = name,
-                .fields = try fields.toOwnedSlice(self.ast_builder.arena.allocator()),
-                .loc = loc,
-            },
+        const return_type = if (self.current_token.type == .arrow) blk: {
+            try self.advance();
+            break :blk try self.parseType();
+        } else ast.Type{ .primitive = .void };
+
+        const body = try self.parseBlock();
+
+        return ast.FnDecl{
+            .name = name,
+            .params = try params.toOwnedSlice(self.ast_builder.arena.allocator()),
+            .return_type = return_type,
+            .body = body.block.stmts,
+            .is_async = false,
+            .is_export = false,
+            .loc = loc,
         };
     }
 
-    fn parseEnumDecl(self: *Parser) !ast.Stmt {
+    fn parseEnumDecl(self: *Parser, is_export: bool) !ast.Stmt {
         const loc = self.location();
         try self.consume(.kw_enum, "Expected 'enum'");
         const name = try self.consumeIdentifier("Expected enum name");
@@ -241,6 +297,7 @@ pub const Parser = struct {
             .enum_decl = .{
                 .name = name,
                 .variants = try variants.toOwnedSlice(self.ast_builder.arena.allocator()),
+                .is_export = is_export,
                 .loc = loc,
             },
         };
@@ -737,11 +794,18 @@ pub const Parser = struct {
                 };
             },
             .string => {
-                const value = self.current_token.lexeme[1 .. self.current_token.lexeme.len - 1]; // strip quotes
+                const full_string = self.current_token.lexeme[1 .. self.current_token.lexeme.len - 1]; // strip quotes
+
+                // Check if string contains interpolation
+                if (std.mem.indexOf(u8, full_string, "{") != null) {
+                    try self.advance();
+                    return try self.parseStringInterpolation(full_string, loc);
+                }
+
                 try self.advance();
                 return ast.Expr{
                     .string_literal = .{
-                        .value = value,
+                        .value = full_string,
                         .loc = loc,
                     },
                 };
@@ -764,9 +828,43 @@ pub const Parser = struct {
                     },
                 };
             },
-            .identifier => {
+            .kw_self, .identifier => {
                 const name = self.current_token.lexeme;
                 try self.advance();
+
+                // Check for struct literal: TypeName { field: value }
+                // Only treat as struct literal if name starts with uppercase (type name convention)
+                const is_type_name = name.len > 0 and name[0] >= 'A' and name[0] <= 'Z';
+                if (is_type_name and self.current_token.type == .left_brace) {
+                    try self.advance();
+                    var fields = std.ArrayList(ast.Expr.StructField).empty;
+
+                    while (self.current_token.type != .right_brace and self.current_token.type != .eof) {
+                        const field_name = try self.consumeIdentifier("Expected field name");
+                        try self.consume(.colon, "Expected ':'");
+                        const field_value = try self.parseExpr();
+
+                        try fields.append(self.ast_builder.arena.allocator(), .{
+                            .name = field_name,
+                            .value = field_value,
+                        });
+
+                        if (self.current_token.type == .comma) {
+                            try self.advance();
+                        }
+                    }
+
+                    try self.consume(.right_brace, "Expected '}'");
+
+                    return ast.Expr{
+                        .struct_literal = .{
+                            .type_name = name,
+                            .fields = try fields.toOwnedSlice(self.ast_builder.arena.allocator()),
+                            .loc = loc,
+                        },
+                    };
+                }
+
                 return ast.Expr{
                     .identifier = .{
                         .name = name,
@@ -810,11 +908,76 @@ pub const Parser = struct {
                     },
                 };
             },
+            .kw_fn => {
+                return try self.parseLambda();
+            },
             else => {
                 std.debug.print("Unexpected token: {s}\n", .{@tagName(self.current_token.type)});
                 return ParseError.UnexpectedToken;
             },
         }
+    }
+
+    fn parseLambda(self: *Parser) !ast.Expr {
+        const loc = self.location();
+        try self.consume(.kw_fn, "Expected 'fn'");
+        try self.consume(.left_paren, "Expected '(' after fn");
+
+        // Parse parameters
+        var params = std.ArrayList(ast.FnParam).empty;
+        while (self.current_token.type != .right_paren and self.current_token.type != .eof) {
+            const param_name = try self.consumeIdentifier("Expected parameter name");
+
+            // Optional type annotation
+            var param_type: ast.Type = ast.Type{ .primitive = .i32 }; // default
+            if (self.current_token.type == .colon) {
+                try self.advance();
+                param_type = try self.parseType();
+            }
+
+            try params.append(self.ast_builder.arena.allocator(), .{
+                .name = param_name,
+                .type_annotation = param_type,
+            });
+
+            if (self.current_token.type == .comma) {
+                try self.advance();
+            }
+        }
+
+        try self.consume(.right_paren, "Expected ')' after parameters");
+
+        // Optional return type
+        var return_type: ?ast.Type = null;
+        if (self.current_token.type == .arrow) {
+            try self.advance();
+            return_type = try self.parseType();
+        }
+
+        // Parse body - either => expr or { block }
+        const body: ast.Expr.LambdaBody = if (self.current_token.type == .fat_arrow) blk: {
+            try self.advance();
+            const expr = try self.parseExpr();
+            const expr_ptr = try self.ast_builder.createExpr(expr);
+            break :blk ast.Expr.LambdaBody{ .expression = expr_ptr };
+        } else if (self.current_token.type == .left_brace) blk: {
+            try self.advance();
+            const stmts = try self.parseBlockContents();
+            try self.consume(.right_brace, "Expected '}' after lambda body");
+            break :blk ast.Expr.LambdaBody{ .block = stmts };
+        } else {
+            std.debug.print("Expected '=>' or '{{' after lambda parameters\n", .{});
+            return ParseError.InvalidSyntax;
+        };
+
+        return ast.Expr{
+            .lambda = .{
+                .params = try params.toOwnedSlice(self.ast_builder.arena.allocator()),
+                .return_type = return_type,
+                .body = body,
+                .loc = loc,
+            },
+        };
     }
 
     fn parseType(self: *Parser) !ast.Type {
@@ -914,5 +1077,135 @@ pub const Parser = struct {
 
             self.advance() catch return;
         }
+    }
+
+    fn parseStringInterpolation(self: *Parser, string: []const u8, loc: ast.SourceLocation) !ast.Expr {
+        var parts: std.ArrayList(ast.Expr.StringPart) = .{};
+        errdefer parts.deinit(self.ast_builder.allocator);
+
+        var i: usize = 0;
+        var current_text_start: usize = 0;
+
+        while (i < string.len) {
+            if (string[i] == '{') {
+                // Save any text before the interpolation
+                if (i > current_text_start) {
+                    try parts.append(self.ast_builder.allocator, .{
+                        .text = string[current_text_start..i],
+                    });
+                }
+
+                // Find the closing brace
+                var brace_count: usize = 1;
+                const expr_start = i + 1;
+                i += 1;
+
+                while (i < string.len and brace_count > 0) {
+                    if (string[i] == '{') {
+                        brace_count += 1;
+                    } else if (string[i] == '}') {
+                        brace_count -= 1;
+                    }
+                    if (brace_count > 0) {
+                        i += 1;
+                    }
+                }
+
+                if (brace_count != 0) {
+                    return ParseError.InvalidSyntax;
+                }
+
+                // Parse the expression inside the braces
+                const expr_str = string[expr_start..i];
+
+                // Create a mini-lexer for the expression
+                var expr_lexer = Lexer.init(self.ast_builder.allocator, expr_str);
+                var expr_parser = try Parser.init(self.ast_builder.allocator, &expr_lexer);
+                const expr = try expr_parser.parseExpr();
+
+                try parts.append(self.ast_builder.allocator, .{
+                    .expr = expr,
+                });
+
+                i += 1; // Skip closing brace
+                current_text_start = i;
+            } else {
+                i += 1;
+            }
+        }
+
+        // Save any remaining text
+        if (current_text_start < string.len) {
+            try parts.append(self.ast_builder.allocator, .{
+                .text = string[current_text_start..],
+            });
+        }
+
+        return ast.Expr{
+            .string_interpolation = .{
+                .parts = try parts.toOwnedSlice(self.ast_builder.allocator),
+                .loc = loc,
+            },
+        };
+    }
+
+    fn parseExportDecl(self: *Parser) !ast.Stmt {
+        try self.consume(.kw_export, "Expected 'export'");
+
+        // After 'export', we expect fn, struct, or enum
+        return switch (self.current_token.type) {
+            .kw_async, .kw_fn => self.parseFnDecl(true),
+            .kw_struct => self.parseStructDecl(true),
+            .kw_enum => self.parseEnumDecl(true),
+            else => {
+                std.debug.print("Unexpected token after 'export': {}\n", .{self.current_token.type});
+                return ParseError.UnexpectedToken;
+            },
+        };
+    }
+
+    fn parseExternFnDecl(self: *Parser) !ast.Stmt {
+        const loc = self.location();
+        try self.consume(.kw_extern, "Expected 'extern'");
+        try self.consume(.kw_fn, "Expected 'fn' after extern");
+
+        const name = try self.consumeIdentifier("Expected function name");
+        try self.consume(.left_paren, "Expected '(' after function name");
+
+        var params = std.ArrayList(ast.FnParam).empty;
+        if (self.current_token.type != .right_paren) {
+            while (true) {
+                const param_name = try self.consumeIdentifier("Expected parameter name");
+                try self.consume(.colon, "Expected ':' after parameter name");
+                const param_type = try self.parseType();
+
+                try params.append(self.ast_builder.arena.allocator(), .{
+                    .name = param_name,
+                    .type_annotation = param_type,
+                });
+
+                if (self.current_token.type != .comma) break;
+                try self.advance();
+            }
+        }
+        try self.consume(.right_paren, "Expected ')' after parameters");
+
+        const return_type = if (self.current_token.type == .arrow) blk: {
+            try self.advance();
+            break :blk try self.parseType();
+        } else null;
+
+        try self.consume(.semicolon, "Expected ';' after extern function declaration");
+
+        return ast.Stmt{
+            .extern_fn_decl = .{
+                .name = name,
+                .params = try params.toOwnedSlice(self.ast_builder.arena.allocator()),
+                .return_type = return_type,
+                .module = "env",  // Default module
+                .import_name = name,  // Use same name by default
+                .loc = loc,
+            },
+        };
     }
 };

@@ -3,6 +3,7 @@ const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const typechecker = @import("typechecker.zig");
 const codegen_wasm = @import("codegen_wasm.zig");
+const module_resolver = @import("module_resolver.zig");
 
 pub const CompileError = error{
     LexerError,
@@ -26,12 +27,25 @@ pub const CompileOptions = struct {
 pub const Compiler = struct {
     allocator: std.mem.Allocator,
     options: CompileOptions,
+    resolver: module_resolver.ModuleResolver,
 
     pub fn init(allocator: std.mem.Allocator, options: CompileOptions) Compiler {
+        var resolver = module_resolver.ModuleResolver.init(allocator);
+
+        // Add default search paths
+        resolver.addSearchPath("stdlib") catch {};
+        resolver.addSearchPath("examples") catch {};
+        resolver.addSearchPath(".") catch {};
+
         return .{
             .allocator = allocator,
             .options = options,
+            .resolver = resolver,
         };
+    }
+
+    pub fn deinit(self: *Compiler) void {
+        self.resolver.deinit();
     }
 
     pub fn compile(self: *Compiler) !void {
@@ -64,6 +78,12 @@ pub const Compiler = struct {
             return CompileError.ParserError;
         }
 
+        // Load imported modules
+        if (self.options.verbose) {
+            std.debug.print("Loading modules...\n", .{});
+        }
+        try self.loadImports(&module, self.options.source_path);
+
         // Type checking
         if (self.options.verbose) {
             std.debug.print("Type checking...\n", .{});
@@ -71,7 +91,8 @@ pub const Compiler = struct {
         var checker = typechecker.TypeChecker.init(self.allocator);
         defer checker.deinit();
 
-        try checker.checkModule(&module);
+        // Pass the resolver to the type checker
+        try checker.checkModuleWithImports(&module, &self.resolver);
 
         if (self.options.check_only) {
             std.debug.print("Type checking completed successfully\n", .{});
@@ -85,7 +106,7 @@ pub const Compiler = struct {
         var codegen = codegen_wasm.WasmCodegen.init(self.allocator);
         defer codegen.deinit();
 
-        const wasm_output = try codegen.generate(&module);
+        const wasm_output = try codegen.generateWithResolver(&module, &self.resolver);
 
         // Write output
         const output_path = self.options.output_path orelse blk: {
@@ -122,10 +143,26 @@ pub const Compiler = struct {
 
         try file.writeAll(content);
     }
+
+    fn loadImports(self: *Compiler, module: *@import("ast.zig").Module, source_path: []const u8) !void {
+        for (module.stmts) |*stmt| {
+            if (stmt.* == .import_stmt) {
+                const import_stmt = stmt.import_stmt;
+
+                if (self.options.verbose) {
+                    std.debug.print("  Loading module: {s}\n", .{import_stmt.from});
+                }
+
+                // Load the imported module
+                _ = try self.resolver.loadModule(import_stmt.from, source_path);
+            }
+        }
+    }
 };
 
 pub fn compileFile(allocator: std.mem.Allocator, options: CompileOptions) !void {
     var compiler = Compiler.init(allocator, options);
+    defer compiler.deinit();
     try compiler.compile();
 }
 
