@@ -2,6 +2,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const Parser = @import("parser.zig").Parser;
 const Lexer = @import("lexer.zig").Lexer;
+const builtin_modules = @import("builtin_modules.zig");
 
 pub const ModuleError = error{
     ModuleNotFound,
@@ -143,6 +144,12 @@ pub const ModuleResolver = struct {
 
     /// Load a module and its dependencies
     pub fn loadModule(self: *ModuleResolver, module_path: []const u8, relative_to: ?[]const u8) !*Module {
+        // Check if it's a built-in module first
+        if (builtin_modules.isBuiltinModule(module_path)) {
+            // Create a virtual module for built-in
+            return try self.createBuiltinModule(module_path);
+        }
+
         // Resolve the full path
         const full_path = try self.resolveModulePath(module_path, relative_to);
         defer if (!std.mem.eql(u8, full_path, module_path)) self.allocator.free(full_path);
@@ -226,5 +233,42 @@ pub const ModuleResolver = struct {
     pub fn getExport(self: *ModuleResolver, module_path: []const u8, symbol_name: []const u8) ?Module.Export {
         const module = self.modules.get(module_path) orelse return null;
         return module.exports.get(symbol_name);
+    }
+
+    /// Create a virtual module for built-in modules
+    fn createBuiltinModule(self: *ModuleResolver, module_path: []const u8) !*Module {
+        // Check if already cached
+        if (self.modules.getPtr(module_path)) |existing| {
+            return existing;
+        }
+
+        const builtin_mod = builtin_modules.getBuiltinModule(module_path) orelse return ModuleError.ModuleNotFound;
+
+        // Create empty AST and exports map
+        const module_ast_ptr = try self.allocator.create(ast.Module);
+        module_ast_ptr.* = ast.Module{
+            .stmts = &[_]ast.Stmt{},
+            .allocator = self.allocator,
+        };
+
+        const exports = std.StringHashMap(Module.Export).init(self.allocator);
+
+        // Mark exports as available (actual implementation is in WASM host functions)
+        // We just need to register the names so type checker knows they exist
+        for (builtin_mod.exports) |_| {
+            // For now, we don't add actual AST nodes since built-ins are implemented in host
+            // The type checker will need special handling for built-in modules
+        }
+
+        const owned_path = try self.allocator.dupe(u8, module_path);
+        const module = Module{
+            .path = owned_path,
+            .source = "", // No source for built-ins
+            .ast = module_ast_ptr,
+            .exports = exports,
+        };
+
+        try self.modules.put(owned_path, module);
+        return self.modules.getPtr(owned_path).?;
     }
 };

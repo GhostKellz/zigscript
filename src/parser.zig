@@ -92,7 +92,7 @@ pub const Parser = struct {
         var params = std.ArrayList(ast.FnParam).empty;
         if (self.current_token.type != .right_paren) {
             while (true) {
-                const param_name = try self.consumeIdentifier("Expected parameter name");
+                const param_name = try self.consumeIdentifierOrKeyword("Expected parameter name");
                 try self.consume(.colon, "Expected ':' after parameter name");
                 const param_type = try self.parseType();
 
@@ -115,6 +115,7 @@ pub const Parser = struct {
         try self.consume(.left_brace, "Expected '{' before function body");
         const body = try self.parseBlockContents();
         try self.consume(.right_brace, "Expected '}' after function body");
+
 
         return ast.Stmt{
             .fn_decl = .{
@@ -174,8 +175,8 @@ pub const Parser = struct {
                 const method = try self.parseStructMethod();
                 try methods.append(self.ast_builder.arena.allocator(), method);
             } else {
-                // It's a field
-                const field_name = try self.consumeIdentifier("Expected field name");
+                // It's a field (allow keywords as field names)
+                const field_name = try self.consumeIdentifierOrKeyword("Expected field name");
                 try self.consume(.colon, "Expected ':' after field name");
                 const field_type = try self.parseType();
 
@@ -213,7 +214,7 @@ pub const Parser = struct {
 
         // Parse parameters (self is implicit, not in param list)
         while (self.current_token.type != .right_paren and self.current_token.type != .eof) {
-            const param_name = try self.consumeIdentifier("Expected parameter name");
+            const param_name = try self.consumeIdentifierOrKeyword("Expected parameter name");
             try self.consume(.colon, "Expected ':' after parameter name");
             const param_type = try self.parseType();
 
@@ -263,7 +264,7 @@ pub const Parser = struct {
                 var variant_fields = std.ArrayList(ast.StructDecl.StructField).empty;
 
                 while (self.current_token.type != .right_paren and self.current_token.type != .eof) {
-                    const field_name = try self.consumeIdentifier("Expected field name");
+                    const field_name = try self.consumeIdentifierOrKeyword("Expected field name");
                     try self.consume(.colon, "Expected ':' after field name");
                     const field_type = try self.parseType();
 
@@ -729,7 +730,7 @@ pub const Parser = struct {
                 .dot => {
                     const loc = self.location();
                     try self.advance();
-                    const member = try self.consumeIdentifier("Expected property name after '.'");
+                    const member = try self.consumeIdentifierOrKeyword("Expected property name after '.'");
                     expr = ast.Expr{
                         .member_access = .{
                             .object = try self.ast_builder.createExpr(expr),
@@ -771,7 +772,6 @@ pub const Parser = struct {
 
     fn parsePrimary(self: *Parser) ParseError!ast.Expr {
         const loc = self.location();
-
         switch (self.current_token.type) {
             .integer => {
                 const value = try std.fmt.parseInt(i64, self.current_token.lexeme, 10);
@@ -840,7 +840,7 @@ pub const Parser = struct {
                     var fields = std.ArrayList(ast.Expr.StructField).empty;
 
                     while (self.current_token.type != .right_brace and self.current_token.type != .eof) {
-                        const field_name = try self.consumeIdentifier("Expected field name");
+                        const field_name = try self.consumeIdentifierOrKeyword("Expected field name");
                         try self.consume(.colon, "Expected ':'");
                         const field_value = try self.parseExpr();
 
@@ -912,6 +912,17 @@ pub const Parser = struct {
                 return try self.parseLambda();
             },
             else => {
+                // Allow keywords as identifiers (for variable/parameter names like 'from', 'to', etc.)
+                if (@intFromEnum(self.current_token.type) >= @intFromEnum(lexer.TokenType.kw_fn)) {
+                    const name = self.current_token.lexeme;
+                    try self.advance();
+                    return ast.Expr{
+                        .identifier = .{
+                            .name = name,
+                            .loc = loc,
+                        },
+                    };
+                }
                 std.debug.print("Unexpected token: {s}\n", .{@tagName(self.current_token.type)});
                 return ParseError.UnexpectedToken;
             },
@@ -926,7 +937,7 @@ pub const Parser = struct {
         // Parse parameters
         var params = std.ArrayList(ast.FnParam).empty;
         while (self.current_token.type != .right_paren and self.current_token.type != .eof) {
-            const param_name = try self.consumeIdentifier("Expected parameter name");
+            const param_name = try self.consumeIdentifierOrKeyword("Expected parameter name");
 
             // Optional type annotation
             var param_type: ast.Type = ast.Type{ .primitive = .i32 }; // default
@@ -1041,6 +1052,17 @@ pub const Parser = struct {
 
     fn consumeIdentifier(self: *Parser, message: []const u8) ![]const u8 {
         if (self.current_token.type == .identifier) {
+            const name = self.current_token.lexeme;
+            try self.advance();
+            return name;
+        }
+        std.debug.print("{s}\n", .{message});
+        return ParseError.UnexpectedToken;
+    }
+
+    fn consumeIdentifierOrKeyword(self: *Parser, message: []const u8) ![]const u8 {
+        // Allow keywords as identifiers (for struct field names, etc.)
+        if (self.current_token.type == .identifier or @intFromEnum(self.current_token.type) >= @intFromEnum(lexer.TokenType.kw_fn)) {
             const name = self.current_token.lexeme;
             try self.advance();
             return name;
@@ -1175,7 +1197,7 @@ pub const Parser = struct {
         var params = std.ArrayList(ast.FnParam).empty;
         if (self.current_token.type != .right_paren) {
             while (true) {
-                const param_name = try self.consumeIdentifier("Expected parameter name");
+                const param_name = try self.consumeIdentifierOrKeyword("Expected parameter name");
                 try self.consume(.colon, "Expected ':' after parameter name");
                 const param_type = try self.parseType();
 

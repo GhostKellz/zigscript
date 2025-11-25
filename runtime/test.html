@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZigScript Runtime Test</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            max-width: 1200px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        h1 {
+            color: #4ec9b0;
+        }
+        h2 {
+            color: #569cd6;
+            margin-top: 30px;
+        }
+        .console {
+            background: #252526;
+            border: 1px solid #3c3c3c;
+            border-radius: 4px;
+            padding: 15px;
+            margin: 20px 0;
+            min-height: 200px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .console-line {
+            margin: 4px 0;
+        }
+        .log { color: #d4d4d4; }
+        .info { color: #4ec9b0; }
+        .warn { color: #dcdcaa; }
+        .error { color: #f48771; }
+        .success { color: #4ec9b0; font-weight: bold; }
+        button {
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 10px;
+        }
+        button:hover {
+            background: #1177bb;
+        }
+        button:disabled {
+            background: #3c3c3c;
+            cursor: not-allowed;
+        }
+        .examples {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .example {
+            background: #252526;
+            border: 1px solid #3c3c3c;
+            border-radius: 4px;
+            padding: 15px;
+        }
+        .example h3 {
+            color: #569cd6;
+            margin-top: 0;
+        }
+        .example code {
+            display: block;
+            background: #1e1e1e;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-size: 12px;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>🚀 ZigScript WebAssembly Runtime</h1>
+    <p>Live testing environment for ZigScript with JSON, HTTP, FS, and async support</p>
+
+    <div id="controls">
+        <button onclick="runJsonTest()">Test JSON</button>
+        <button onclick="runHttpTest()">Test HTTP</button>
+        <button onclick="runFsTest()">Test File System</button>
+        <button onclick="runTimerTest()">Test Timers</button>
+        <button onclick="clearConsole()">Clear Console</button>
+    </div>
+
+    <h2>Console Output</h2>
+    <div class="console" id="console"></div>
+
+    <h2>Live Examples</h2>
+    <div class="examples">
+        <div class="example">
+            <h3>JSON Operations</h3>
+            <code>
+let user = { id: 1, name: "Alice" };
+let json = JSON.encode(user);
+let decoded = JSON.decode(json);
+console.log(decoded.name);
+            </code>
+            <button onclick="runJsonTest()">Run</button>
+        </div>
+
+        <div class="example">
+            <h3>HTTP Request</h3>
+            <code>
+async fn fetchData() {
+    let response = await http.get(
+        "https://api.github.com/repos/zig"
+    );
+    return response;
+}
+            </code>
+            <button onclick="runHttpTest()">Run</button>
+        </div>
+
+        <div class="example">
+            <h3>File System</h3>
+            <code>
+await fs.writeFile(
+    "data.txt",
+    "Hello ZigScript!"
+);
+let content = await fs.readFile("data.txt");
+console.log(content);
+            </code>
+            <button onclick="runFsTest()">Run</button>
+        </div>
+
+        <div class="example">
+            <h3>Timers</h3>
+            <code>
+setTimeout(fn() {
+    console.log("Timer fired!");
+}, 1000);
+            </code>
+            <button onclick="runTimerTest()">Run</button>
+        </div>
+    </div>
+
+    <script src="zigscript_runtime.js"></script>
+    <script>
+        const runtime = new ZigScriptRuntime();
+        const consoleDiv = document.getElementById('console');
+
+        // Override console methods to capture output
+        const originalLog = console.log;
+        const originalError = console.error;
+        const originalWarn = console.warn;
+
+        function addConsoleLine(message, type = 'log') {
+            const line = document.createElement('div');
+            line.className = `console-line ${type}`;
+            line.textContent = message;
+            consoleDiv.appendChild(line);
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+        }
+
+        console.log = function(...args) {
+            addConsoleLine(args.join(' '), 'log');
+            originalLog.apply(console, args);
+        };
+
+        console.error = function(...args) {
+            addConsoleLine('❌ ' + args.join(' '), 'error');
+            originalError.apply(console, args);
+        };
+
+        console.warn = function(...args) {
+            addConsoleLine('⚠️  ' + args.join(' '), 'warn');
+            originalWarn.apply(console, args);
+        };
+
+        console.info = function(...args) {
+            addConsoleLine('ℹ️  ' + args.join(' '), 'info');
+            originalLog.apply(console, args);
+        };
+
+        function clearConsole() {
+            consoleDiv.innerHTML = '';
+        }
+
+        function runJsonTest() {
+            console.info('=== JSON Test ===');
+            const json_ptr = runtime.writeString('{"id": 1, "name": "Alice", "active": true}');
+            const result_ptr = runtime.json_decode(json_ptr, 0);
+
+            if (result_ptr !== 0) {
+                console.log('✅ JSON decode successful!');
+                const encoded_ptr = runtime.json_encode(result_ptr);
+                if (encoded_ptr !== 0) {
+                    const encoded = runtime.readString(encoded_ptr);
+                    console.log('✅ JSON encode result:', encoded);
+                }
+            } else {
+                console.error('JSON decode failed');
+            }
+        }
+
+        async function runHttpTest() {
+            console.info('=== HTTP Test ===');
+            const url_ptr = runtime.writeString('https://api.github.com/zen');
+            const promise_id = runtime.http_get(url_ptr, 0);
+            console.log(`Promise ID: ${promise_id}`);
+
+            // Wait for promise to resolve
+            setTimeout(() => {
+                const result = runtime.promise_await(promise_id);
+                if (result !== 0) {
+                    const response = runtime.readString(result);
+                    console.log('✅ HTTP Response:', response);
+                } else {
+                    console.warn('Promise still pending or failed');
+                }
+            }, 2000);
+        }
+
+        function runFsTest() {
+            console.info('=== File System Test ===');
+
+            // Write file
+            const path_ptr = runtime.writeString('test.txt');
+            const content_ptr = runtime.writeString('Hello from ZigScript!');
+            const write_promise = runtime.fs_write_file(path_ptr, content_ptr, 0, 0);
+
+            console.log(`Write promise ID: ${write_promise}`);
+
+            // Read file back
+            setTimeout(() => {
+                const read_promise = runtime.fs_read_file(path_ptr, 0);
+                setTimeout(() => {
+                    const result = runtime.promise_await(read_promise);
+                    if (result !== 0) {
+                        const content = runtime.readString(result);
+                        console.log('✅ File content:', content);
+                    }
+                }, 100);
+            }, 100);
+        }
+
+        function runTimerTest() {
+            console.info('=== Timer Test ===');
+
+            // Create a mock callback
+            const callback = () => {
+                console.log('✅ Timer callback executed!');
+            };
+
+            // Simulate timeout (in real WASM, this would use function table)
+            setTimeout(() => {
+                console.log('⏰ Timer fired after 1000ms');
+                callback();
+            }, 1000);
+
+            console.log('Timer set for 1000ms...');
+        }
+
+        // Welcome message
+        console.info('🚀 ZigScript Runtime initialized');
+        console.info('Click the buttons above to test different features');
+    </script>
+</body>
+</html>

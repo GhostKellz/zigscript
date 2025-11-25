@@ -12,7 +12,40 @@
   (import "std" "promise_await" (func $promise_await (param i32) (result i32)))
 
   (func $main (export "main") (result i32)
-    i32.const 42
+    (local $user i32)
+    ;; struct literal at 8192
+    i32.const 1
+    i32.const 8192
+    i32.store
+    ;; string literal "Alice" at 8204
+    i32.const 8204
+    i32.const 5
+    i32.store
+    i32.const 8208
+    i32.const 65
+    i32.store8
+    i32.const 8209
+    i32.const 108
+    i32.store8
+    i32.const 8210
+    i32.const 105
+    i32.store8
+    i32.const 8211
+    i32.const 99
+    i32.store8
+    i32.const 8212
+    i32.const 101
+    i32.store8
+    i32.const 8204  ;; string pointer
+    i32.const 8196
+    i32.store
+    i32.const 1
+    i32.const 8200
+    i32.store
+    i32.const 8192  ;; struct pointer
+    local.set $user
+    local.get $user
+    i32.load  ;; load field id
     return
   )
 

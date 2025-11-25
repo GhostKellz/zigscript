@@ -1,0 +1,7 @@
+export struct Test {
+    x: i32,
+}
+
+fn main() -> i32 {
+    return 0;
+}

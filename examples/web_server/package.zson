@@ -1,0 +1,32 @@
+{
+  // Web Server Example - demonstrates ZigScript + Nexus integration
+  name: "zigscript-web-server",
+  version: "1.0.0",
+  description: "A simple HTTP server built with ZigScript and Nexus runtime",
+  author: "ZigScript Team",
+  license: "MIT",
+
+  // Compatibility
+  zigscript: "^0.1.0",
+  zig: "0.16.0",
+
+  // Entry point
+  main: "server.zs",
+
+  // Dependencies (when we have packages)
+  dependencies: {
+    // "http-server": "^2.1.0",  // TODO: Create this package
+  },
+
+  // Scripts
+  scripts: {
+    dev: "nexus-zs run server.zs",
+    build: "zs build server.zs",
+    start: "nexus-zs run server.wasm",
+  },
+
+  repository: {
+    type: "git",
+    url: "https://github.com/you/zigscript.git",
+  },
+}

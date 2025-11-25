@@ -18,7 +18,7 @@ pub fn compile(allocator: std.mem.Allocator, options: compiler.CompileOptions) !
 }
 
 // Version information
-pub const version = "0.1.0-alpha";
+pub const version = "0.1.0";
 pub const phase = "Phase 1 - Core Language MVP";
 
 test "zs library imports" {

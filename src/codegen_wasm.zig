@@ -14,26 +14,34 @@ pub const CodegenError = error{
 // For Phase 1, we'll generate a text format (.wat) that can be converted to binary .wasm
 pub const WasmCodegen = struct {
     allocator: std.mem.Allocator,
-    output: std.ArrayList(u8),
+    output: std.ArrayListUnmanaged(u8),
     indent_level: usize,
     local_count: usize,
     locals: std.StringHashMap(usize), // variable name -> local index
     local_types: std.StringHashMap([]const u8), // variable name -> type name (for structs)
+    lambda_vars: std.StringHashMap(void), // Track which variables hold lambdas (function values)
     memory_allocator: wasm_memory.WasmAllocator,
     module: ?*ast.Module, // Reference to AST module for type lookups
     lambda_count: usize, // Counter for generating unique lambda function names
+    lambda_functions: std.ArrayListUnmanaged(u8), // Store lambda functions separately to emit at module level
+    function_table_entries: std.ArrayListUnmanaged([]const u8), // Track function names for table
+    expected_type: ?ast.Type, // Expected type context for expressions (for i64 coercion)
 
     pub fn init(allocator: std.mem.Allocator) WasmCodegen {
         return .{
             .allocator = allocator,
-            .output = std.ArrayList(u8).empty,
+            .output = .{},
             .indent_level = 0,
             .local_count = 0,
             .locals = std.StringHashMap(usize).init(allocator),
             .local_types = std.StringHashMap([]const u8).init(allocator),
+            .lambda_vars = std.StringHashMap(void).init(allocator),
             .memory_allocator = wasm_memory.WasmAllocator.init(),
             .module = null,
             .lambda_count = 0,
+            .lambda_functions = .{},
+            .function_table_entries = .{},
+            .expected_type = null,
         };
     }
 
@@ -41,6 +49,13 @@ pub const WasmCodegen = struct {
         self.output.deinit(self.allocator);
         self.locals.deinit();
         self.local_types.deinit();
+        self.lambda_vars.deinit();
+        self.lambda_functions.deinit(self.allocator);
+        // Free each lambda name string before deiniting the list
+        for (self.function_table_entries.items) |name| {
+            self.allocator.free(name);
+        }
+        self.function_table_entries.deinit(self.allocator);
     }
 
     // Helper: Infer if expression is f64 type
@@ -98,19 +113,33 @@ pub const WasmCodegen = struct {
         try self.emitIndent();
         try self.emit("(import \"env\" \"js_console_log\" (func $console_log (param i32 i32)))\n");
 
-        // Import Nexus host functions for async operations
+        // Import JSON functions
         try self.emitIndent();
-        try self.emit("(import \"nexus\" \"http_get\" (func $nexus_http_get (param i32 i32) (result i32)))\n");
+        try self.emit("(import \"std\" \"json_decode\" (func $json_decode (param i32 i32) (result i32)))\n");
         try self.emitIndent();
-        try self.emit("(import \"nexus\" \"http_post\" (func $nexus_http_post (param i32 i32 i32 i32) (result i32)))\n");
+        try self.emit("(import \"std\" \"json_encode\" (func $json_encode (param i32) (result i32)))\n");
+
+        // Import HTTP client functions
         try self.emitIndent();
-        try self.emit("(import \"nexus\" \"fs_read_file\" (func $nexus_fs_read_file (param i32 i32) (result i32)))\n");
+        try self.emit("(import \"std\" \"http_get\" (func $http_get (param i32 i32) (result i32)))\n");
         try self.emitIndent();
-        try self.emit("(import \"nexus\" \"fs_write_file\" (func $nexus_fs_write_file (param i32 i32 i32 i32) (result i32)))\n");
+        try self.emit("(import \"std\" \"http_post\" (func $http_post (param i32 i32 i32 i32) (result i32)))\n");
+
+        // Import file system functions
         try self.emitIndent();
-        try self.emit("(import \"nexus\" \"set_timeout\" (func $nexus_set_timeout (param i32) (result i32)))\n");
+        try self.emit("(import \"std\" \"fs_read_file\" (func $fs_read_file (param i32 i32) (result i32)))\n");
         try self.emitIndent();
-        try self.emit("(import \"nexus\" \"promise_await\" (func $nexus_promise_await (param i32) (result i32)))\n");
+        try self.emit("(import \"std\" \"fs_write_file\" (func $fs_write_file (param i32 i32 i32 i32) (result i32)))\n");
+
+        // Import timer functions
+        try self.emitIndent();
+        try self.emit("(import \"std\" \"set_timeout\" (func $set_timeout (param i32 i32) (result i32)))\n");
+        try self.emitIndent();
+        try self.emit("(import \"std\" \"clear_timeout\" (func $clear_timeout (param i32)))\n");
+
+        // Import Nexus async functions (for Promise integration)
+        try self.emitIndent();
+        try self.emit("(import \"std\" \"promise_await\" (func $promise_await (param i32) (result i32)))\n");
 
         try self.emit("\n");
 
@@ -119,9 +148,58 @@ pub const WasmCodegen = struct {
             try self.generateImportedFunctions(module, res);
         }
 
+        // Save output position before generating functions
+        const imports_end_pos = self.output.items.len;
+
         // Generate code for each statement in this module
         for (module.stmts) |*stmt| {
             try self.genStmt(stmt);
+        }
+
+        // Now emit type definitions BEFORE the functions if we have lambdas
+        if (self.function_table_entries.items.len > 0) {
+            // Create type definitions buffer
+            var type_defs = std.ArrayListUnmanaged(u8){};
+            defer type_defs.deinit(self.allocator);
+
+            // Generate type definitions
+            var param_count: usize = 0;
+            while (param_count <= 4) : (param_count += 1) {
+                try type_defs.appendSlice(self.allocator, "  (type $lambda_type_");
+                const count_str = try std.fmt.allocPrint(self.allocator, "{d}", .{param_count});
+                defer self.allocator.free(count_str);
+                try type_defs.appendSlice(self.allocator, count_str);
+                try type_defs.appendSlice(self.allocator, " (func");
+                var i: usize = 0;
+                while (i < param_count) : (i += 1) {
+                    try type_defs.appendSlice(self.allocator, " (param i32)");
+                }
+                try type_defs.appendSlice(self.allocator, " (result i32)))\n");
+            }
+            try type_defs.appendSlice(self.allocator, "\n");
+
+            // Insert type definitions before functions
+            try self.output.insertSlice(self.allocator, imports_end_pos, type_defs.items);
+        }
+
+        // Emit lambda functions
+        if (self.lambda_functions.items.len > 0) {
+            try self.output.appendSlice(self.allocator, self.lambda_functions.items);
+        }
+
+        // Emit function table if we have lambdas
+        if (self.function_table_entries.items.len > 0) {
+            try self.emitIndent();
+            try self.emit("(table ");
+            try self.emitInt(@intCast(self.function_table_entries.items.len));
+            try self.emit(" funcref)\n");
+            try self.emitIndent();
+            try self.emit("(elem (i32.const 0)");
+            for (self.function_table_entries.items) |name| {
+                try self.emit(" $");
+                try self.emit(name);
+            }
+            try self.emit(")\n");
         }
 
         self.indent_level -= 1;
@@ -376,7 +454,22 @@ pub const WasmCodegen = struct {
                 try self.local_types.put(let_decl.name, initializer.struct_literal.type_name);
             }
 
+            // Track if this variable holds a lambda
+            if (initializer.* == .lambda) {
+                try self.lambda_vars.put(let_decl.name, {});
+            }
+
+            // Set expected type for integer literal coercion
+            const saved_expected_type = self.expected_type;
+            if (let_decl.type_annotation) |type_ann| {
+                self.expected_type = type_ann;
+            }
+
             try self.genExpr(initializer);
+
+            // Restore expected type
+            self.expected_type = saved_expected_type;
+
             try self.emitIndent();
             try self.emit("local.set $");
             try self.emit(let_decl.name);
@@ -607,6 +700,16 @@ pub const WasmCodegen = struct {
         switch (expr.*) {
             .integer_literal => |lit| {
                 try self.emitIndent();
+                // Check if we should emit i64 instead of i32
+                if (self.expected_type) |expected| {
+                    if (expected == .primitive and expected.primitive == .i64) {
+                        try self.emit("i64.const ");
+                        try self.emitInt(lit.value);
+                        try self.emit("\n");
+                        return;
+                    }
+                }
+                // Default to i32
                 try self.emit("i32.const ");
                 try self.emitInt(lit.value);
                 try self.emit("\n");
@@ -759,6 +862,7 @@ pub const WasmCodegen = struct {
                         const obj_name = member.object.identifier.name;
                         if (self.local_types.get(obj_name)) |type_name| {
                             struct_type_name = type_name;
+                        } else {
                         }
                     }
 
@@ -780,41 +884,95 @@ pub const WasmCodegen = struct {
                         try self.emit(member.member);
                         try self.emit("\n");
                         return;
+                    } else {
                     }
                 }
 
-                // Regular function call
-                // Generate arguments
-                for (call.args) |*arg| {
-                    try self.genExpr(arg);
-                }
+                // Regular function call - check if it's a lambda call
+                // Extract function name from callee first to check if it's a lambda
+                const is_lambda_call = blk: {
+                    if (call.callee.* == .identifier) {
+                        const id = call.callee.identifier;
+                        break :blk self.lambda_vars.contains(id.name);
+                    }
+                    break :blk false;
+                };
 
-                // Generate call
-                try self.emitIndent();
-                try self.emit("call $");
+                if (is_lambda_call) {
+                    // Lambda call using call_indirect
+                    // Generate arguments
+                    for (call.args) |*arg| {
+                        try self.genExpr(arg);
+                    }
 
-                // Extract function name from callee
-                switch (call.callee.*) {
-                    .identifier => |id| {
-                        try self.emit(id.name);
-                    },
-                    .member_access => |*member| {
-                        // Handle console.log(), etc.
-                        switch (member.object.*) {
-                            .identifier => |id| {
-                                if (std.mem.eql(u8, id.name, "console") and std.mem.eql(u8, member.member, "log")) {
-                                    try self.emit("console_log");
-                                } else {
+                    // Load lambda index from variable
+                    const id = call.callee.identifier;
+                    try self.emitIndent();
+                    try self.emit("local.get $");
+                    try self.emit(id.name);
+                    try self.emit("\n");
+
+                    // Emit call_indirect with type signature
+                    try self.emitIndent();
+                    try self.emit("call_indirect (type $lambda_type_");
+                    try self.emitInt(@intCast(call.args.len));
+                    try self.emit(")\n");
+                } else {
+                    // Regular function call
+                    // Get function name first to look up signature
+                    const fn_name = switch (call.callee.*) {
+                        .identifier => |id| id.name,
+                        else => null,
+                    };
+
+                    // Generate arguments with proper types
+                    for (call.args, 0..) |*arg, i| {
+                        // Try to set expected type from function signature
+                        if (fn_name) |name| {
+                            if (self.module) |mod| {
+                                for (mod.stmts) |stmt| {
+                                    if (stmt == .fn_decl and std.mem.eql(u8, stmt.fn_decl.name, name)) {
+                                        if (i < stmt.fn_decl.params.len) {
+                                            self.expected_type = stmt.fn_decl.params[i].type_annotation;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        try self.genExpr(arg);
+                        self.expected_type = null; // Reset
+                    }
+
+                    // Generate call
+                    try self.emitIndent();
+                    try self.emit("call $");
+
+                    // Extract function name from callee
+                    switch (call.callee.*) {
+                        .identifier => |id| {
+                            try self.emit(id.name);
+                        },
+                        .member_access => |*member| {
+                            // Handle console.log(), etc.
+                            switch (member.object.*) {
+                                .identifier => |id| {
+                                    if (std.mem.eql(u8, id.name, "console") and std.mem.eql(u8, member.member, "log")) {
+                                        try self.emit("console_log");
+                                    } else {
+                                        try self.emit(member.member);
+                                    }
+                                },
+                                else => {
                                     return CodegenError.UnsupportedFeature;
                                 }
-                            },
-                            else => return CodegenError.UnsupportedFeature,
-                        }
-                    },
-                    else => return CodegenError.UnsupportedFeature,
-                }
+                            }
+                        },
+                        else => return CodegenError.UnsupportedFeature,
+                    }
 
-                try self.emit("\n");
+                    try self.emit("\n");
+                }
             },
             .string_literal => |*str_lit| {
                 // Store string in linear memory: [length: i32][...bytes...]
@@ -1098,18 +1256,89 @@ pub const WasmCodegen = struct {
                 }
             },
             .lambda => |*lambda| {
-                // For now, lambdas are not directly callable in WASM
-                // They need to be stored as function pointers or passed to higher-order functions
-                // Simplified: generate a stub that returns 0
-                // Full implementation would:
-                // 1. Generate a unique function name
-                // 2. Emit the function with captured variables
-                // 3. Return a function pointer/index
-                _ = lambda;
+                // Generate unique lambda function
+                const lambda_name = try std.fmt.allocPrint(
+                    self.allocator,
+                    "lambda_{d}",
+                    .{self.lambda_count}
+                );
+                const lambda_index = self.lambda_count;
+                self.lambda_count += 1;
+
+                // Save current output and switch to lambda_functions buffer
+                const saved_output = self.output;
+                self.output = .{};
+                const saved_locals = self.locals;
+                self.locals = std.StringHashMap(usize).init(self.allocator);
+                const saved_local_count = self.local_count;
+                self.local_count = 0;
+
+                // Generate lambda function
                 try self.emitIndent();
-                try self.emit(";; lambda expression (stub)\n");
+                try self.emit("(func $");
+                try self.emit(lambda_name);
+
+                // Parameters
+                for (lambda.params) |param| {
+                    try self.emit(" (param $");
+                    try self.emit(param.name);
+                    try self.emit(" ");
+                    try self.emit(try self.typeToWasm(param.type_annotation));
+                    try self.emit(")");
+                    try self.locals.put(param.name, self.local_count);
+                    self.local_count += 1;
+                }
+
+                // Return type
+                if (lambda.return_type) |ret_type| {
+                    const wasm_type = try self.typeToWasm(ret_type);
+                    if (!std.mem.eql(u8, wasm_type, "void")) {
+                        try self.emit(" (result ");
+                        try self.emit(wasm_type);
+                        try self.emit(")");
+                    }
+                } else {
+                    // Infer return type from body
+                    try self.emit(" (result i32)");
+                }
+
+                try self.emit("\n");
+                self.indent_level += 1;
+
+                // Generate lambda body
+                switch (lambda.body) {
+                    .expression => |expr_ptr| {
+                        try self.genExpr(expr_ptr);
+                        try self.emitIndent();
+                        try self.emit("return\n");
+                    },
+                    .block => |stmts| {
+                        for (stmts) |*stmt| {
+                            try self.genStmt(stmt);
+                        }
+                    },
+                }
+
+                self.indent_level -= 1;
                 try self.emitIndent();
-                try self.emit("i32.const 0  ;; TODO: lambda function pointer\n");
+                try self.emit(")\n\n");
+
+                // Save lambda function
+                try self.lambda_functions.appendSlice(self.allocator, self.output.items);
+                try self.function_table_entries.append(self.allocator, lambda_name);
+
+                // Restore output
+                self.output.deinit(self.allocator);
+                self.output = saved_output;
+                self.locals.deinit();
+                self.locals = saved_locals;
+                self.local_count = saved_local_count;
+
+                // Return lambda index for function table
+                try self.emitIndent();
+                try self.emit("i32.const ");
+                try self.emitInt(@intCast(lambda_index));
+                try self.emit("  ;; lambda index\n");
             },
         }
     }

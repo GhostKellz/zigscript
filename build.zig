@@ -89,6 +89,26 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // Add REPL executable
+    const repl_exe = b.addExecutable(.{
+        .name = "zs-repl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/repl.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zs", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(repl_exe);
+
+    // Add REPL run step
+    const repl_step = b.step("repl", "Run the ZigScript REPL");
+    const run_repl = b.addRunArtifact(repl_exe);
+    repl_step.dependOn(&run_repl.step);
+    run_repl.step.dependOn(b.getInstallStep());
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

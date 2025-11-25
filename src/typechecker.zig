@@ -254,7 +254,12 @@ pub const TypeChecker = struct {
             blk: {
                 // If both annotation and initializer exist, verify they match
                 if (inferred_type) |inf| {
-                    if (!try self.typesMatch(annotation, inf)) {
+                    // Allow integer literal coercion: i32 literal can become i64
+                    const is_int_coercion = (annotation == .primitive and annotation.primitive == .i64 and
+                                              inf == .primitive and inf.primitive == .i32 and
+                                              let_decl.initializer != null and let_decl.initializer.? == .integer_literal);
+
+                    if (!is_int_coercion and !try self.typesMatch(annotation, inf)) {
                         std.debug.print("Type mismatch in variable '{s}'\n", .{let_decl.name});
                         return TypeError.TypeMismatch;
                     }
@@ -409,6 +414,34 @@ pub const TypeChecker = struct {
             },
 
             .call => |*call| blk: {
+                // Check if callee is a variable with function type (lambda)
+                if (call.callee.* == .identifier) {
+                    const id = call.callee.identifier;
+                    if (self.lookupVariable(id.name)) |var_info| {
+                        if (var_info.type_def == .function) {
+                            const fn_type = var_info.type_def.function;
+
+                            // Check argument count
+                            if (call.args.len != fn_type.params.len) {
+                                return TypeError.WrongNumberOfArguments;
+                            }
+
+                            // Check argument types
+                            for (call.args, 0..) |*arg, i| {
+                                const arg_type = try self.checkExpr(arg);
+                                if (!try self.typesMatch(arg_type, fn_type.params[i])) {
+                                    return TypeError.TypeMismatch;
+                                }
+                            }
+
+                            // Return function's return type
+                            break :blk fn_type.return_type.*;
+                        }
+                    } else |_| {
+                        // Not a variable, might be a declared function
+                    }
+                }
+
                 // Get function name from callee (assume it's an identifier for now)
                 const fn_name = switch (call.callee.*) {
                     .identifier => |id| id.name,
@@ -439,7 +472,13 @@ pub const TypeChecker = struct {
                 for (call.args, 0..) |*arg, i| {
                     const arg_type = try self.checkExpr(arg);
                     const param_type = fn_sig.params[i].type_annotation;
-                    if (!try self.typesMatch(arg_type, param_type)) {
+
+                    // Allow integer literal coercion: i32 literal can become i64
+                    const is_int_coercion = (param_type == .primitive and param_type.primitive == .i64 and
+                                              arg_type == .primitive and arg_type.primitive == .i32 and
+                                              arg.* == .integer_literal);
+
+                    if (!is_int_coercion and !try self.typesMatch(arg_type, param_type)) {
                         std.debug.print("Argument {d} type mismatch in call to '{s}'\n", .{ i, fn_name });
                         return TypeError.TypeMismatch;
                     }
@@ -634,6 +673,15 @@ pub const TypeChecker = struct {
                     param_types[i] = param.type_annotation;
                 }
 
+                // Create new scope for lambda parameters
+                try self.beginScope();
+                defer self.endScope();
+
+                // Register lambda parameters in scope
+                for (lambda.params) |param| {
+                    try self.defineVariable(param.name, param.type_annotation, false);
+                }
+
                 // Determine return type from body
                 const return_type = if (lambda.return_type) |ret_type| blk2: {
                     const ret_ptr = try self.arena.allocator().create(ast.Type);
@@ -645,7 +693,9 @@ pub const TypeChecker = struct {
                         .expression => |expr_ptr| try self.checkExpr(expr_ptr),
                         .block => |stmts| blk3: {
                             // Check for return statements in block
-                            _ = stmts;
+                            for (stmts) |*stmt| {
+                                try self.checkStmt(stmt);
+                            }
                             break :blk3 ast.Type{ .primitive = .void };
                         },
                     };
@@ -672,8 +722,9 @@ pub const TypeChecker = struct {
     }
 
     fn endScope(self: *TypeChecker) void {
-        if (self.scopes.items.len > 0) {
-            _ = self.scopes.pop();
+        if (self.scopes.pop()) |scope| {
+            var mutable_scope = scope;
+            mutable_scope.deinit();
         }
     }
 
