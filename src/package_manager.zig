@@ -7,16 +7,17 @@ pub const PackageManager = struct {
     allocator: std.mem.Allocator,
     cache_dir: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator) !PackageManager {
+    pub fn init(allocator: std.mem.Allocator, environ_map: *const std.process.Environ.Map) !PackageManager {
         // Get cache directory: ~/.cache/zim/zigscript/packages/
-        const home = std.posix.getenv("HOME") orelse ".";
-        const cache_dir = try std.fs.path.join(
+        const home = environ_map.get("HOME") orelse ".";
+        const cache_dir = try std.Io.Dir.path.join(
             allocator,
             &[_][]const u8{ home, ".cache", "zim", "zigscript", "packages" },
         );
 
         // Ensure cache directory exists (creates intermediate directories)
-        std.fs.cwd().makePath(cache_dir) catch |err| {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.cwd().createDirPath(io, cache_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
@@ -49,15 +50,16 @@ pub const PackageManager = struct {
         std.debug.print("✅ Created package.zson\n", .{});
 
         // Create src directory
-        std.fs.cwd().makeDir("src") catch |err| {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.cwd().createDir(io, "src", .default_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
         // Create src/main.zs
-        const main_file = try std.fs.cwd().createFile("src/main.zs", .{});
-        defer main_file.close();
+        const main_file = try std.Io.Dir.cwd().createFile(io, "src/main.zs", .{});
+        defer main_file.close(io);
 
-        try main_file.writeAll(
+        try main_file.writeStreamingAll(io,
             \\fn main() -> i32 {
             \\    console.log("Hello from " ++ NAME ++ "!");
             \\    return 0;
@@ -180,18 +182,20 @@ pub const PackageManager = struct {
         version: []const u8,
     ) !void {
         // Create package directory in cache
-        const pkg_path = try std.fs.path.join(
+        const pkg_path = try std.Io.Dir.path.join(
             self.allocator,
             &[_][]const u8{ self.cache_dir, package_name, version },
         );
         defer self.allocator.free(pkg_path);
 
+        const io = std.Io.Threaded.global_single_threaded.io();
+
         // Check if already downloaded
-        std.fs.accessAbsolute(pkg_path, .{}) catch |err| {
+        std.Io.Dir.accessAbsolute(io, pkg_path, .{}) catch |err| {
             if (err == error.FileNotFound) {
                 // TODO: Actually download from registry
                 // For now, just create the directory as a placeholder
-                try std.fs.makeDirAbsolute(pkg_path);
+                try std.Io.Dir.createDirAbsolute(io, pkg_path, .default_dir);
                 std.debug.print("  📥 Downloaded {s}@{s}\n", .{ package_name, version });
             } else {
                 return err;
@@ -201,8 +205,8 @@ pub const PackageManager = struct {
 };
 
 /// Initialize new package
-pub fn initCmd(allocator: std.mem.Allocator, name: []const u8) !void {
-    var pm = try PackageManager.init(allocator);
+pub fn initCmd(allocator: std.mem.Allocator, environ_map: *const std.process.Environ.Map, name: []const u8) !void {
+    var pm = try PackageManager.init(allocator, environ_map);
     defer pm.deinit();
 
     try pm.initPackage(name);
@@ -211,18 +215,19 @@ pub fn initCmd(allocator: std.mem.Allocator, name: []const u8) !void {
 /// Add dependency
 pub fn addCmd(
     allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
     package_name: []const u8,
     version: ?[]const u8,
 ) !void {
-    var pm = try PackageManager.init(allocator);
+    var pm = try PackageManager.init(allocator, environ_map);
     defer pm.deinit();
 
     try pm.addDependency(package_name, version);
 }
 
 /// Install all dependencies
-pub fn installCmd(allocator: std.mem.Allocator) !void {
-    var pm = try PackageManager.init(allocator);
+pub fn installCmd(allocator: std.mem.Allocator, environ_map: *const std.process.Environ.Map) !void {
+    var pm = try PackageManager.init(allocator, environ_map);
     defer pm.deinit();
 
     try pm.install();

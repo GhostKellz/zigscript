@@ -29,10 +29,11 @@ pub const Env = struct {
     }
 
     pub fn get(self: *Env, key: []const u8) !?[]const u8 {
-        return std.process.getEnvVarOwned(self.allocator, key) catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return null,
-            else => return err,
-        };
+        // Note: In WASM environment, env vars are typically provided by the host.
+        // This placeholder returns null. Real implementation would query host.
+        _ = self;
+        _ = key;
+        return null;
     }
 
     pub fn set(self: *Env, key: []const u8, value: []const u8) !void {
@@ -94,22 +95,23 @@ pub fn Optional(comptime T: type) type {
 pub fn List(comptime T: type) type {
     return struct {
         items: std.ArrayList(T),
+        allocator: std.mem.Allocator,
 
         const Self = @This();
 
         pub fn init(allocator: std.mem.Allocator) Self {
-            _ = allocator;
             return .{
                 .items = std.ArrayList(T).empty,
+                .allocator = allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.items.deinit();
+            self.items.deinit(self.allocator);
         }
 
         pub fn append(self: *Self, item: T) !void {
-            try self.items.append(item);
+            try self.items.append(self.allocator, item);
         }
 
         pub fn get(self: *Self, index: usize) ?T {
@@ -182,23 +184,23 @@ pub const String = struct {
 
     pub fn init(allocator: std.mem.Allocator) String {
         return .{
-            .buffer = std.ArrayList(u8){},
+            .buffer = std.ArrayList(u8).empty,
             .allocator = allocator,
         };
     }
 
     pub fn fromSlice(allocator: std.mem.Allocator, bytes: []const u8) !String {
         var s = String.init(allocator);
-        try s.buffer.appendSlice(bytes);
+        try s.buffer.appendSlice(allocator, bytes);
         return s;
     }
 
     pub fn deinit(self: *String) void {
-        self.buffer.deinit();
+        self.buffer.deinit(self.allocator);
     }
 
     pub fn append(self: *String, other: []const u8) !void {
-        try self.buffer.appendSlice(other);
+        try self.buffer.appendSlice(self.allocator, other);
     }
 
     pub fn len(self: *const String) usize {

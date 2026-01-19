@@ -2,22 +2,21 @@ const std = @import("std");
 const zs = @import("zs");
 const package_manager = @import("package_manager.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const arena = init.arena.allocator();
 
-    const stdout_file = std.posix.STDOUT_FILENO;
-    const stdout_handle = std.fs.File{ .handle = stdout_file };
+    const stdout_handle = std.Io.File.stdout();
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = stdout_handle.writer(&stdout_buffer);
+    var stdout_writer = stdout_handle.writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(arena);
 
     if (args.len < 2) {
         try printUsage(stdout);
+        try stdout_writer.flush();
         return;
     }
 
@@ -27,6 +26,7 @@ pub fn main() !void {
         if (args.len < 3) {
             try stdout.print("Error: No input file specified\n", .{});
             try printUsage(stdout);
+            try stdout_writer.flush();
             return;
         }
 
@@ -61,6 +61,7 @@ pub fn main() !void {
         if (args.len < 3) {
             try stdout.print("Error: No input file specified\n", .{});
             try printUsage(stdout);
+            try stdout_writer.flush();
             return;
         }
 
@@ -74,11 +75,12 @@ pub fn main() !void {
         };
     } else if (std.mem.eql(u8, command, "init")) {
         const pkg_name = if (args.len >= 3) args[2] else "my-package";
-        try package_manager.initCmd(allocator, pkg_name);
+        try package_manager.initCmd(allocator, init.environ_map, pkg_name);
     } else if (std.mem.eql(u8, command, "add")) {
         if (args.len < 3) {
             try stdout.print("Error: No package specified\n", .{});
             try stdout.print("Usage: zs add <package>[@version]\n", .{});
+            try stdout_writer.flush();
             return;
         }
 
@@ -93,16 +95,19 @@ pub fn main() !void {
             version = pkg_spec[idx + 1 ..];
         }
 
-        try package_manager.addCmd(allocator, pkg_name, version);
+        try package_manager.addCmd(allocator, init.environ_map, pkg_name, version);
     } else if (std.mem.eql(u8, command, "install")) {
-        try package_manager.installCmd(allocator);
+        try package_manager.installCmd(allocator, init.environ_map);
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version")) {
         try stdout.print("ZigScript (zs) v{s}\n", .{zs.version});
+        try stdout_writer.flush();
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help")) {
         try printUsage(stdout);
+        try stdout_writer.flush();
     } else {
         try stdout.print("Unknown command: {s}\n\n", .{command});
         try printUsage(stdout);
+        try stdout_writer.flush();
     }
 }
 

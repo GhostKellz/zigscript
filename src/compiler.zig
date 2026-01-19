@@ -111,8 +111,8 @@ pub const Compiler = struct {
         // Write output
         const output_path = self.options.output_path orelse blk: {
             // Default output: replace .zs with .wat
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
-            const base = std.fs.path.basename(self.options.source_path);
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const base = std.Io.Dir.path.basename(self.options.source_path);
             const name = if (std.mem.endsWith(u8, base, ".zs"))
                 base[0 .. base.len - 3]
             else
@@ -133,15 +133,17 @@ pub const Compiler = struct {
     }
 
     fn readFile(self: *Compiler, path: []const u8) ![]u8 {
-        return try std.fs.cwd().readFileAlloc(path, self.allocator, .unlimited);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .unlimited);
     }
 
     fn writeFile(self: *Compiler, path: []const u8, content: []const u8) !void {
         _ = self;
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
 
-        try file.writeAll(content);
+        try file.writeStreamingAll(io, content);
     }
 
     fn loadImports(self: *Compiler, module: *@import("ast.zig").Module, source_path: []const u8) !void {
@@ -171,6 +173,7 @@ test "compiler initialization" {
     const options = CompileOptions{
         .source_path = "test.zs",
     };
-    const compiler = Compiler.init(allocator, options);
+    var compiler = Compiler.init(allocator, options);
+    defer compiler.deinit();
     try std.testing.expectEqualStrings("test.zs", compiler.options.source_path);
 }

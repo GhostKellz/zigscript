@@ -2,24 +2,19 @@ const std = @import("std");
 const Lexer = @import("lexer.zig").Lexer;
 const Parser = @import("parser.zig").Parser;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    var io_threaded = std.Io.Threaded.init(allocator);
-    defer io_threaded.deinit();
-    const io = io_threaded.io();
-
-    const stdout_handle = std.fs.File.stdout();
+    const stdout_handle = std.Io.File.stdout();
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = stdout_handle.writer(&stdout_buffer);
+    var stdout_writer = stdout_handle.writer(io, &stdout_buffer);
 
     // Print welcome message
     try stdout_writer.interface.writeAll(
         \\
         \\\x1b[36m╔════════════════════════════════════════╗
-        \\\x1b[36m║  🚀 ZigScript REPL v0.1.0             ║
+        \\\x1b[36m║  ZigScript REPL v0.1.0                 ║
         \\\x1b[36m╚════════════════════════════════════════╝\x1b[0m
         \\
         \\Type ZigScript expressions or declarations
@@ -40,7 +35,7 @@ pub fn main() !void {
         history.deinit(allocator);
     }
 
-    const stdin_handle = std.fs.File.stdin();
+    const stdin_handle = std.Io.File.stdin();
     var stdin_buffer: [4096]u8 = undefined;
     var stdin_reader = stdin_handle.reader(io, &stdin_buffer);
 

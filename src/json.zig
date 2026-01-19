@@ -109,19 +109,19 @@ pub const JsonParser = struct {
     }
 
     fn parseArray(self: *JsonParser) !JsonValue {
-        var items = std.ArrayList(JsonValue).init(self.allocator);
+        var items: std.ArrayList(JsonValue) = .empty;
 
         self.pos += 1; // skip '['
         self.skipWhitespace();
 
         if (self.peek() == ']') {
             self.pos += 1;
-            return JsonValue{ .array = try items.toOwnedSlice() };
+            return JsonValue{ .array = try items.toOwnedSlice(self.allocator) };
         }
 
         while (true) {
             const value = try self.parseValue();
-            try items.append(value);
+            try items.append(self.allocator, value);
 
             self.skipWhitespace();
             const next = self.peek();
@@ -135,7 +135,7 @@ pub const JsonParser = struct {
             }
         }
 
-        return JsonValue{ .array = try items.toOwnedSlice() };
+        return JsonValue{ .array = try items.toOwnedSlice(self.allocator) };
     }
 
     fn parseString(self: *JsonParser) ![]const u8 {
@@ -226,54 +226,54 @@ pub const JsonStringifier = struct {
     pub fn init(allocator: std.mem.Allocator) JsonStringifier {
         return .{
             .allocator = allocator,
-            .output = std.ArrayList(u8).init(allocator),
+            .output = std.ArrayList(u8).empty,
         };
     }
 
     pub fn deinit(self: *JsonStringifier) void {
-        self.output.deinit();
+        self.output.deinit(self.allocator);
     }
 
     pub fn stringify(self: *JsonStringifier, value: JsonValue) ![]const u8 {
         try self.writeValue(value);
-        return self.output.toOwnedSlice();
+        return self.output.toOwnedSlice(self.allocator);
     }
 
     fn writeValue(self: *JsonStringifier, value: JsonValue) !void {
         switch (value) {
-            .null_value => try self.output.appendSlice("null"),
-            .bool_value => |b| try self.output.appendSlice(if (b) "true" else "false"),
+            .null_value => try self.output.appendSlice(self.allocator, "null"),
+            .bool_value => |b| try self.output.appendSlice(self.allocator, if (b) "true" else "false"),
             .number => |n| {
                 var buf: [100]u8 = undefined;
                 const str = try std.fmt.bufPrint(&buf, "{d}", .{n});
-                try self.output.appendSlice(str);
+                try self.output.appendSlice(self.allocator, str);
             },
             .string => |s| {
-                try self.output.append('"');
-                try self.output.appendSlice(s);
-                try self.output.append('"');
+                try self.output.append(self.allocator, '"');
+                try self.output.appendSlice(self.allocator, s);
+                try self.output.append(self.allocator, '"');
             },
             .array => |arr| {
-                try self.output.append('[');
+                try self.output.append(self.allocator, '[');
                 for (arr, 0..) |item, i| {
-                    if (i > 0) try self.output.append(',');
+                    if (i > 0) try self.output.append(self.allocator, ',');
                     try self.writeValue(item);
                 }
-                try self.output.append(']');
+                try self.output.append(self.allocator, ']');
             },
             .object => |obj| {
-                try self.output.append('{');
+                try self.output.append(self.allocator, '{');
                 var it = obj.iterator();
                 var first = true;
                 while (it.next()) |entry| {
-                    if (!first) try self.output.append(',');
+                    if (!first) try self.output.append(self.allocator, ',');
                     first = false;
-                    try self.output.append('"');
-                    try self.output.appendSlice(entry.key_ptr.*);
-                    try self.output.appendSlice("\":");
+                    try self.output.append(self.allocator, '"');
+                    try self.output.appendSlice(self.allocator, entry.key_ptr.*);
+                    try self.output.appendSlice(self.allocator, "\":");
                     try self.writeValue(entry.value_ptr.*);
                 }
-                try self.output.append('}');
+                try self.output.append(self.allocator, '}');
             },
         }
     }

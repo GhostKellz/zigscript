@@ -1102,7 +1102,7 @@ pub const Parser = struct {
     }
 
     fn parseStringInterpolation(self: *Parser, string: []const u8, loc: ast.SourceLocation) !ast.Expr {
-        var parts: std.ArrayList(ast.Expr.StringPart) = .{};
+        var parts: std.ArrayList(ast.Expr.StringPart) = .empty;
         errdefer parts.deinit(self.ast_builder.allocator);
 
         var i: usize = 0;

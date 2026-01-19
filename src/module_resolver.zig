@@ -44,8 +44,8 @@ pub const ModuleResolver = struct {
         return .{
             .allocator = allocator,
             .modules = std.StringHashMap(Module).init(allocator),
-            .loading_stack = std.ArrayList([]const u8){},
-            .search_paths = std.ArrayList([]const u8){},
+            .loading_stack = std.ArrayList([]const u8).empty,
+            .search_paths = std.ArrayList([]const u8).empty,
         };
     }
 
@@ -73,10 +73,11 @@ pub const ModuleResolver = struct {
     fn resolveModulePath(self: *ModuleResolver, module_path: []const u8, relative_to: ?[]const u8) ![]const u8 {
         // Try different extensions
         const extensions = [_][]const u8{ ".zs", "" };
+        const io = std.Io.Threaded.global_single_threaded.io();
 
         // If it's a relative import and we have a base path, try that first
         if (relative_to) |base| {
-            const dir = std.fs.path.dirname(base) orelse ".";
+            const dir = std.Io.Dir.path.dirname(base) orelse ".";
 
             for (extensions) |ext| {
                 const full_path = try std.fmt.allocPrint(
@@ -87,12 +88,12 @@ pub const ModuleResolver = struct {
                 errdefer self.allocator.free(full_path);
 
                 // Check if file exists
-                const file = std.fs.cwd().openFile(full_path, .{}) catch |err| {
+                const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch |err| {
                     self.allocator.free(full_path);
                     if (err == error.FileNotFound) continue;
                     return err;
                 };
-                file.close();
+                file.close(io);
 
                 return full_path;
             }
@@ -108,12 +109,12 @@ pub const ModuleResolver = struct {
                 );
                 errdefer self.allocator.free(full_path);
 
-                const file = std.fs.cwd().openFile(full_path, .{}) catch |err| {
+                const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch |err| {
                     self.allocator.free(full_path);
                     if (err == error.FileNotFound) continue;
                     return err;
                 };
-                file.close();
+                file.close(io);
 
                 return full_path;
             }
@@ -128,12 +129,12 @@ pub const ModuleResolver = struct {
             );
             errdefer self.allocator.free(full_path);
 
-            const file = std.fs.cwd().openFile(full_path, .{}) catch |err| {
+            const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch |err| {
                 self.allocator.free(full_path);
                 if (err == error.FileNotFound) continue;
                 return err;
             };
-            file.close();
+            file.close(io);
 
             return full_path;
         }
@@ -172,7 +173,8 @@ pub const ModuleResolver = struct {
         defer _ = self.loading_stack.pop();
 
         // Read the file (don't free - it needs to stay alive for AST string references)
-        const source = try std.fs.cwd().readFileAlloc(full_path, self.allocator, .unlimited);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const source = try std.Io.Dir.cwd().readFileAlloc(io, full_path, self.allocator, .unlimited);
         errdefer self.allocator.free(source);
 
         // Parse the module

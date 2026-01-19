@@ -37,7 +37,7 @@ pub const TypeChecker = struct {
         const checker = TypeChecker{
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
-            .scopes = std.ArrayList(Scope){},
+            .scopes = std.ArrayList(Scope).empty,
             .current_function = null,
             .types = std.StringHashMap(ast.Type).init(allocator),
             .functions = std.StringHashMap(FunctionSignature).init(allocator),
@@ -321,18 +321,18 @@ pub const TypeChecker = struct {
 
         // Check then block
         try self.beginScope();
+        defer self.endScope();
         for (if_stmt.then_block) |*stmt| {
             try self.checkStmt(stmt);
         }
-        self.endScope();
 
         // Check else block
         if (if_stmt.else_block) |else_block| {
             try self.beginScope();
+            defer self.endScope();
             for (else_block) |*stmt| {
                 try self.checkStmt(stmt);
             }
-            self.endScope();
         }
     }
 

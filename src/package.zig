@@ -126,12 +126,13 @@ pub const Manifest = struct {
 
     /// Load manifest from package.zson file
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Manifest {
-        // Read file
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        // Initialize I/O first so we can use it for file operations
+        const io = std.Io.Threaded.global_single_threaded.io();
 
-        var io_threaded = std.Io.Threaded.init(allocator);
-        const io = io_threaded.io();
+        // Read file
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+
         var buffer: [4096]u8 = undefined;
         var file_reader = file.reader(io, &buffer);
         const content = try file_reader.interface.readAlloc(allocator, 10 * 1024 * 1024); // 10MB max
@@ -337,11 +338,12 @@ pub const Manifest = struct {
 
     /// Save manifest to package.zson file (using ZSON format)
     pub fn save(self: *Manifest, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
 
         var buf_storage: [4096]u8 = undefined;
-        var file_writer = file.writer(&buf_storage);
+        var file_writer = file.writer(io, &buf_storage);
         const writer = &file_writer.interface;
 
         try writer.writeAll("{\n");
@@ -405,11 +407,12 @@ pub const Manifest = struct {
     pub fn generateBuildZon(self: *Manifest, path: []const u8) !void {
         if (self.zig_dependencies.count() == 0) return;
 
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
 
         var buf_storage: [4096]u8 = undefined;
-        var file_writer = file.writer(&buf_storage);
+        var file_writer = file.writer(io, &buf_storage);
         const writer = &file_writer.interface;
 
         try writer.writeAll(".{\n");
