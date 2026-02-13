@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     try stdout_writer.interface.writeAll(
         \\
         \\\x1b[36m╔════════════════════════════════════════╗
-        \\\x1b[36m║  ZigScript REPL v0.1.0                 ║
+        \\\x1b[36m║  ZigScript REPL v0.1.2                 ║
         \\\x1b[36m╚════════════════════════════════════════╝\x1b[0m
         \\
         \\Type ZigScript expressions or declarations

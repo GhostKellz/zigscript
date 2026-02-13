@@ -130,12 +130,37 @@ pub const WasmMemory = struct {
     }
 
     /// Allocate space in WASM memory (simple bump allocator)
+    /// Uses a bump allocator starting from the end of initial data
     pub fn alloc(self: *WasmMemory, size: usize) !u32 {
-        // TODO: Implement proper memory management
-        // For now, this is a placeholder
-        _ = self;
-        _ = size;
-        return 0;
+        // Simple bump allocator - track allocation offset
+        // Start allocations at offset 4096 (leave space for initial data)
+        const base_offset: usize = 4096;
+
+        // Find next free position (stored at offset 0-3 as allocation pointer)
+        var alloc_ptr: u32 = undefined;
+        if (self.data.len >= 4) {
+            alloc_ptr = std.mem.readInt(u32, self.data[0..4], .little);
+            if (alloc_ptr < base_offset) {
+                alloc_ptr = @intCast(base_offset);
+            }
+        } else {
+            alloc_ptr = @intCast(base_offset);
+        }
+
+        // Align to 4 bytes
+        const aligned_ptr = (alloc_ptr + 3) & ~@as(u32, 3);
+        const aligned_size = (size + 3) & ~@as(usize, 3);
+
+        // Check if we have space
+        if (aligned_ptr + aligned_size > self.data.len) {
+            return error.OutOfMemory;
+        }
+
+        // Update allocation pointer
+        const new_ptr = aligned_ptr + @as(u32, @intCast(aligned_size));
+        std.mem.writeInt(u32, self.data[0..4], new_ptr, .little);
+
+        return aligned_ptr;
     }
 };
 

@@ -303,8 +303,123 @@ pub const Module = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Module) void {
-        // TODO: Deep cleanup of all allocated nodes
+        // Deep cleanup of all allocated nodes
+        for (self.stmts) |*stmt| {
+            self.freeStmt(stmt);
+        }
         self.allocator.free(self.stmts);
+    }
+
+    fn freeStmt(self: *Module, stmt: *Stmt) void {
+        switch (stmt.*) {
+            .expr_stmt => |*es| self.freeExpr(&es.expr),
+            .let_decl => |*ld| {
+                if (ld.initializer) |*init| self.freeExpr(init);
+            },
+            .fn_decl => |*fd| {
+                for (fd.body) |*s| self.freeStmt(s);
+            },
+            .struct_decl => |*sd| {
+                for (sd.methods) |*m| {
+                    for (m.body) |*s| self.freeStmt(s);
+                }
+            },
+            .return_stmt => |*rs| {
+                if (rs.value) |*v| self.freeExpr(v);
+            },
+            .if_stmt => |*is| {
+                self.freeExpr(&is.condition);
+                for (is.then_block) |*s| self.freeStmt(s);
+                if (is.else_block) |eb| {
+                    for (eb) |*s| self.freeStmt(s);
+                }
+            },
+            .block => |*b| {
+                for (b.stmts) |*s| self.freeStmt(s);
+            },
+            .for_stmt => |*fs| {
+                self.freeExpr(&fs.iterable);
+                for (fs.body) |*s| self.freeStmt(s);
+            },
+            .while_stmt => |*ws| {
+                self.freeExpr(&ws.condition);
+                for (ws.body) |*s| self.freeStmt(s);
+            },
+            .enum_decl, .import_stmt, .extern_fn_decl, .break_stmt, .continue_stmt => {},
+        }
+    }
+
+    fn freeExpr(self: *Module, expr: *Expr) void {
+        switch (expr.*) {
+            .binary => |*b| {
+                self.freeExpr(b.left);
+                self.freeExpr(b.right);
+                self.allocator.destroy(b.left);
+                self.allocator.destroy(b.right);
+            },
+            .unary => |*u| {
+                self.freeExpr(u.operand);
+                self.allocator.destroy(u.operand);
+            },
+            .call => |*c| {
+                self.freeExpr(c.callee);
+                self.allocator.destroy(c.callee);
+                for (c.args) |*a| self.freeExpr(a);
+            },
+            .member_access => |*ma| {
+                self.freeExpr(ma.object);
+                self.allocator.destroy(ma.object);
+            },
+            .index_access => |*ia| {
+                self.freeExpr(ia.object);
+                self.freeExpr(ia.index);
+                self.allocator.destroy(ia.object);
+                self.allocator.destroy(ia.index);
+            },
+            .array_literal => |*al| {
+                for (al.elements) |*e| self.freeExpr(e);
+            },
+            .struct_literal => |*sl| {
+                for (sl.fields) |*f| self.freeExpr(&f.value);
+            },
+            .await_expr => |*ae| {
+                self.freeExpr(ae.expr);
+                self.allocator.destroy(ae.expr);
+            },
+            .try_expr => |*te| {
+                self.freeExpr(te.expr);
+                self.allocator.destroy(te.expr);
+            },
+            .string_interpolation => |*si| {
+                for (si.parts) |*p| {
+                    if (p.* == .expr) self.freeExpr(&p.expr);
+                }
+            },
+            .match_expr => |*me| {
+                self.freeExpr(me.value);
+                self.allocator.destroy(me.value);
+                for (me.arms) |*a| self.freeExpr(&a.body);
+            },
+            .assign_expr => |*ae| {
+                self.freeExpr(ae.target);
+                self.freeExpr(ae.value);
+                self.allocator.destroy(ae.target);
+                self.allocator.destroy(ae.value);
+            },
+            .lambda => |*l| {
+                switch (l.body) {
+                    .expression => |e| {
+                        self.freeExpr(e);
+                        self.allocator.destroy(e);
+                    },
+                    .block => |stmts| {
+                        for (stmts) |*s| self.freeStmt(s);
+                    },
+                }
+            },
+            // Leaf nodes - no nested allocations
+            .integer_literal, .float_literal, .string_literal, .bool_literal, .identifier => {},
+        }
     }
 };
 

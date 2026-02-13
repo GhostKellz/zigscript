@@ -141,6 +141,10 @@ pub const WasmCodegen = struct {
         try self.emitIndent();
         try self.emit("(import \"std\" \"promise_await\" (func $promise_await (param i32) (result i32)))\n");
 
+        // Import memory allocator for dynamic arrays
+        try self.emitIndent();
+        try self.emit("(import \"env\" \"alloc\" (func $alloc (param i32) (result i32)))\n");
+
         try self.emit("\n");
 
         // If we have a resolver, generate imported functions first
@@ -670,10 +674,81 @@ pub const WasmCodegen = struct {
                     // else branch continues with next arm
                 },
                 .enum_variant => |*variant| {
-                    // TODO: Proper enum tag checking
-                    _ = variant;
-                    try self.emit(";; enum variant pattern (stub)\n");
+                    // Enum variant pattern matching
+                    // Enums are represented as tagged unions: [tag: i32][payload...]
+                    // Tag is the variant index (0, 1, 2, ...)
+                    try self.emit("(if (result i32)\n");
+                    self.indent_level += 1;
+
+                    // Load tag from match value and compare with variant index
+                    try self.emitIndent();
+                    try self.emit("(i32.eq\n");
+                    self.indent_level += 1;
+                    try self.emitIndent();
+                    try self.emit("local.get $match_val\n");
+                    try self.emitIndent();
+                    try self.emit("i32.load  ;; load enum tag\n");
+
+                    // Look up variant index from module's enum declarations
+                    var variant_index: i32 = 0;
+                    if (self.module) |mod| {
+                        outer: for (mod.stmts) |stmt| {
+                            if (stmt == .enum_decl) {
+                                const enum_decl = stmt.enum_decl;
+                                for (enum_decl.variants, 0..) |v, idx| {
+                                    if (std.mem.eql(u8, v.name, variant.name)) {
+                                        variant_index = @intCast(idx);
+                                        break :outer;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    try self.emitIndent();
+                    try self.emit("i32.const ");
+                    try self.emitInt(variant_index);
+                    try self.emit("  ;; variant index for ");
+                    try self.emit(variant.name);
+                    try self.emit("\n");
+                    self.indent_level -= 1;
+                    try self.emitIndent();
+                    try self.emit(")\n");
+
+                    try self.emitIndent();
+                    try self.emit("(then\n");
+                    self.indent_level += 1;
+
+                    // If variant has a payload binding, extract it
+                    if (variant.payload) |payload| {
+                        if (payload.* == .identifier) {
+                            const payload_name = payload.identifier;
+                            try self.emitIndent();
+                            try self.emit("(local $");
+                            try self.emit(payload_name);
+                            try self.emit(" i32)\n");
+                            try self.emitIndent();
+                            try self.emit("local.get $match_val\n");
+                            try self.emitIndent();
+                            try self.emit("i32.const 4\n");
+                            try self.emitIndent();
+                            try self.emit("i32.add\n");
+                            try self.emitIndent();
+                            try self.emit("i32.load  ;; load payload\n");
+                            try self.emitIndent();
+                            try self.emit("local.set $");
+                            try self.emit(payload_name);
+                            try self.emit("\n");
+                        }
+                    }
+
                     try self.genExpr(&arm.body);
+                    self.indent_level -= 1;
+                    try self.emitIndent();
+                    try self.emit(")\n");
+                    try self.emitIndent();
+                    try self.emit("(else\n");
+                    // else branch continues with next arm
                 },
             }
         }
@@ -1384,32 +1459,323 @@ pub const WasmCodegen = struct {
         try self.emit(str);
     }
     fn genStringInterpolation(self: *WasmCodegen, interp: *const ast.Expr.StringInterpolation) !void {
-        // For string interpolation, we'll use a simple approach:
-        // 1. Allocate memory for the concatenated result (estimate max size)
-        // 2. Write each part sequentially
-        // 3. Return pointer to start
+        // String interpolation implementation:
+        // 1. Allocate buffer for result (estimate max size based on parts)
+        // 2. Track write position
+        // 3. For each part: copy text or convert expression to string
+        // 4. Store final length and return pointer
 
-        // For now, simplified version: just allocate space and store parts
-        // A full implementation would need actual string concat host function
-
-        const alloc_ptr = self.memory_allocator.alloc(256); // Max 256 bytes for interpolated string
+        // Estimate size: 64 bytes per part as baseline
+        const estimated_size: u32 = @as(u32, @intCast(interp.parts.len)) * 64 + 64;
+        const result_ptr = self.memory_allocator.alloc(estimated_size);
 
         try self.emitIndent();
         try self.emit(";; String interpolation\n");
 
-        // Store string parts - for MVP just return allocated pointer
-        // In a full impl, we'd iterate and concat each part
-        _ = interp;
+        // Declare locals for tracking
+        try self.emitIndent();
+        try self.emit("(local $interp_ptr i32)\n");
+        try self.emitIndent();
+        try self.emit("(local $interp_len i32)\n");
 
+        // Initialize write pointer (skip length field)
         try self.emitIndent();
         try self.emit("i32.const ");
-        try self.emit(try std.fmt.allocPrint(self.allocator, "{d}", .{alloc_ptr}));
-        try self.emit("  ;; interpolated string ptr\n");
+        try self.emitInt(@intCast(result_ptr + 4));
+        try self.emit("\n");
+        try self.emitIndent();
+        try self.emit("local.set $interp_ptr\n");
 
-        // TODO: Implement actual string concatenation
-        // For each part:
-        //   - If text: write literal bytes
-        //   - If expr: convert to string and append
+        // Initialize length to 0
+        try self.emitIndent();
+        try self.emit("i32.const 0\n");
+        try self.emitIndent();
+        try self.emit("local.set $interp_len\n");
+
+        // Process each part
+        for (interp.parts) |part| {
+            switch (part) {
+                .text => |text| {
+                    // Write literal text bytes
+                    for (text) |byte| {
+                        try self.emitIndent();
+                        try self.emit("local.get $interp_ptr\n");
+                        try self.emitIndent();
+                        try self.emit("i32.const ");
+                        try self.emitInt(@intCast(byte));
+                        try self.emit("\n");
+                        try self.emitIndent();
+                        try self.emit("i32.store8\n");
+
+                        // Increment pointer
+                        try self.emitIndent();
+                        try self.emit("local.get $interp_ptr\n");
+                        try self.emitIndent();
+                        try self.emit("i32.const 1\n");
+                        try self.emitIndent();
+                        try self.emit("i32.add\n");
+                        try self.emitIndent();
+                        try self.emit("local.set $interp_ptr\n");
+
+                        // Increment length
+                        try self.emitIndent();
+                        try self.emit("local.get $interp_len\n");
+                        try self.emitIndent();
+                        try self.emit("i32.const 1\n");
+                        try self.emitIndent();
+                        try self.emit("i32.add\n");
+                        try self.emitIndent();
+                        try self.emit("local.set $interp_len\n");
+                    }
+                },
+                .expr => |*expr| {
+                    // Generate expression - result should be i32
+                    // For numeric types, convert to string representation
+                    try self.emitIndent();
+                    try self.emit(";; interpolate expression\n");
+                    try self.genExpr(@constCast(expr));
+
+                    // Store the value temporarily and convert to string
+                    // For MVP: just store as decimal digits
+                    try self.emitIndent();
+                    try self.emit("(local $expr_val i32)\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $expr_val\n");
+
+                    // Simple i32 to decimal conversion (handles positive numbers)
+                    try self.emitIndent();
+                    try self.emit(";; convert i32 to string (simplified)\n");
+                    try self.emitIndent();
+                    try self.emit("(block $conv_done\n");
+                    self.indent_level += 1;
+
+                    // Check if zero
+                    try self.emitIndent();
+                    try self.emit("local.get $expr_val\n");
+                    try self.emitIndent();
+                    try self.emit("i32.eqz\n");
+                    try self.emitIndent();
+                    try self.emit("if\n");
+                    self.indent_level += 1;
+                    try self.emitIndent();
+                    try self.emit("local.get $interp_ptr\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 48  ;; '0'\n");
+                    try self.emitIndent();
+                    try self.emit("i32.store8\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $interp_ptr\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 1\n");
+                    try self.emitIndent();
+                    try self.emit("i32.add\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $interp_ptr\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $interp_len\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 1\n");
+                    try self.emitIndent();
+                    try self.emit("i32.add\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $interp_len\n");
+                    try self.emitIndent();
+                    try self.emit("br $conv_done\n");
+                    self.indent_level -= 1;
+                    try self.emitIndent();
+                    try self.emit("end\n");
+
+                    // Non-zero: extract digits (reverse order, then reverse)
+                    try self.emitIndent();
+                    try self.emit(";; digit extraction for non-zero values\n");
+                    try self.emitIndent();
+                    try self.emit("(local $digit_count i32)\n");
+                    try self.emitIndent();
+                    try self.emit("(local $digit_start i32)\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $interp_ptr\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $digit_start\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 0\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $digit_count\n");
+
+                    try self.emitIndent();
+                    try self.emit("(loop $digit_loop\n");
+                    self.indent_level += 1;
+                    try self.emitIndent();
+                    try self.emit("local.get $expr_val\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 0\n");
+                    try self.emitIndent();
+                    try self.emit("i32.gt_s\n");
+                    try self.emitIndent();
+                    try self.emit("if\n");
+                    self.indent_level += 1;
+                    // Get digit: val % 10 + '0'
+                    try self.emitIndent();
+                    try self.emit("local.get $interp_ptr\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $expr_val\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 10\n");
+                    try self.emitIndent();
+                    try self.emit("i32.rem_s\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 48\n");
+                    try self.emitIndent();
+                    try self.emit("i32.add\n");
+                    try self.emitIndent();
+                    try self.emit("i32.store8\n");
+                    // val = val / 10
+                    try self.emitIndent();
+                    try self.emit("local.get $expr_val\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 10\n");
+                    try self.emitIndent();
+                    try self.emit("i32.div_s\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $expr_val\n");
+                    // ptr++, count++
+                    try self.emitIndent();
+                    try self.emit("local.get $interp_ptr\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 1\n");
+                    try self.emitIndent();
+                    try self.emit("i32.add\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $interp_ptr\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $digit_count\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 1\n");
+                    try self.emitIndent();
+                    try self.emit("i32.add\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $digit_count\n");
+                    try self.emitIndent();
+                    try self.emit("br $digit_loop\n");
+                    self.indent_level -= 1;
+                    try self.emitIndent();
+                    try self.emit("end\n");
+                    self.indent_level -= 1;
+                    try self.emitIndent();
+                    try self.emit(")\n");
+
+                    // Update total length
+                    try self.emitIndent();
+                    try self.emit("local.get $interp_len\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $digit_count\n");
+                    try self.emitIndent();
+                    try self.emit("i32.add\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $interp_len\n");
+
+                    // Reverse digits in place (they were written backwards)
+                    try self.emitIndent();
+                    try self.emit(";; reverse digits\n");
+                    try self.emitIndent();
+                    try self.emit("(local $rev_left i32)\n");
+                    try self.emitIndent();
+                    try self.emit("(local $rev_right i32)\n");
+                    try self.emitIndent();
+                    try self.emit("(local $rev_tmp i32)\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $digit_start\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $rev_left\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $interp_ptr\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 1\n");
+                    try self.emitIndent();
+                    try self.emit("i32.sub\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $rev_right\n");
+
+                    try self.emitIndent();
+                    try self.emit("(loop $rev_loop\n");
+                    self.indent_level += 1;
+                    try self.emitIndent();
+                    try self.emit("local.get $rev_left\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $rev_right\n");
+                    try self.emitIndent();
+                    try self.emit("i32.lt_s\n");
+                    try self.emitIndent();
+                    try self.emit("if\n");
+                    self.indent_level += 1;
+                    // Swap
+                    try self.emitIndent();
+                    try self.emit("local.get $rev_left\n");
+                    try self.emitIndent();
+                    try self.emit("i32.load8_u\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $rev_tmp\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $rev_left\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $rev_right\n");
+                    try self.emitIndent();
+                    try self.emit("i32.load8_u\n");
+                    try self.emitIndent();
+                    try self.emit("i32.store8\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $rev_right\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $rev_tmp\n");
+                    try self.emitIndent();
+                    try self.emit("i32.store8\n");
+                    // Move pointers
+                    try self.emitIndent();
+                    try self.emit("local.get $rev_left\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 1\n");
+                    try self.emitIndent();
+                    try self.emit("i32.add\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $rev_left\n");
+                    try self.emitIndent();
+                    try self.emit("local.get $rev_right\n");
+                    try self.emitIndent();
+                    try self.emit("i32.const 1\n");
+                    try self.emitIndent();
+                    try self.emit("i32.sub\n");
+                    try self.emitIndent();
+                    try self.emit("local.set $rev_right\n");
+                    try self.emitIndent();
+                    try self.emit("br $rev_loop\n");
+                    self.indent_level -= 1;
+                    try self.emitIndent();
+                    try self.emit("end\n");
+                    self.indent_level -= 1;
+                    try self.emitIndent();
+                    try self.emit(")\n");
+
+                    self.indent_level -= 1;
+                    try self.emitIndent();
+                    try self.emit(")\n");
+                },
+            }
+        }
+
+        // Store final length at result_ptr
+        try self.emitIndent();
+        try self.emit("i32.const ");
+        try self.emitInt(@intCast(result_ptr));
+        try self.emit("\n");
+        try self.emitIndent();
+        try self.emit("local.get $interp_len\n");
+        try self.emitIndent();
+        try self.emit("i32.store\n");
+
+        // Return pointer to the string (pointing at length field)
+        try self.emitIndent();
+        try self.emit("i32.const ");
+        try self.emitInt(@intCast(result_ptr));
+        try self.emit("  ;; interpolated string ptr\n");
     }
 
     // Array method implementations
@@ -1661,12 +2027,210 @@ pub const WasmCodegen = struct {
     }
 
     fn genArrayFilter(self: *WasmCodegen, array_expr: *ast.Expr, args: []ast.Expr) !void {
-        _ = args;
-        _ = array_expr;
-        // Simplified: allocate result array, iterate, test predicate, append if true
-        // TODO: implement filter logic
+        if (args.len != 1) return CodegenError.UnsupportedFeature;
+
+        // arr.filter(predicate) - create new array with elements where predicate returns true
+        // Get source array
         try self.emitIndent();
-        try self.emit("i32.const 0  ;; TODO: filter implementation\n");
+        try self.emit(";; array.filter implementation\n");
+
+        try self.genExpr(array_expr);
+        try self.emitIndent();
+        try self.emit("local.tee $src_arr\n");
+        try self.emitIndent();
+        try self.emit("i32.load  ;; load source length\n");
+        try self.emitIndent();
+        try self.emit("local.tee $src_len\n");
+
+        // Allocate new array with same capacity (may not use all)
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.mul  ;; elements size\n");
+        try self.emitIndent();
+        try self.emit("i32.const 8\n");
+        try self.emitIndent();
+        try self.emit("i32.add  ;; + metadata\n");
+        try self.emitIndent();
+        try self.emit("call $alloc\n");
+        try self.emitIndent();
+        try self.emit("local.tee $filter_arr\n");
+
+        // Initialize new array length to 0
+        try self.emitIndent();
+        try self.emit("i32.const 0\n");
+        try self.emitIndent();
+        try self.emit("i32.store  ;; initial length = 0\n");
+
+        // Store capacity
+        try self.emitIndent();
+        try self.emit("local.get $filter_arr\n");
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $src_len\n");
+        try self.emitIndent();
+        try self.emit("i32.store  ;; capacity = src_len\n");
+
+        // Loop counter and result length
+        try self.emitIndent();
+        try self.emit("(local $filter_i i32)\n");
+        try self.emitIndent();
+        try self.emit("(local $filter_len i32)\n");
+        try self.emitIndent();
+        try self.emit("(local $filter_elem i32)\n");
+        try self.emitIndent();
+        try self.emit("i32.const 0\n");
+        try self.emitIndent();
+        try self.emit("local.set $filter_i\n");
+        try self.emitIndent();
+        try self.emit("i32.const 0\n");
+        try self.emitIndent();
+        try self.emit("local.set $filter_len\n");
+
+        // Filter loop
+        try self.emitIndent();
+        try self.emit("(loop $filter_loop\n");
+        self.indent_level += 1;
+
+        // Check if i < src_len
+        try self.emitIndent();
+        try self.emit("local.get $filter_i\n");
+        try self.emitIndent();
+        try self.emit("local.get $src_len\n");
+        try self.emitIndent();
+        try self.emit("i32.lt_s\n");
+        try self.emitIndent();
+        try self.emit("if\n");
+        self.indent_level += 1;
+
+        // Load element: src_arr + 8 + (i * 4)
+        try self.emitIndent();
+        try self.emit("local.get $src_arr\n");
+        try self.emitIndent();
+        try self.emit("i32.const 8\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $filter_i\n");
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.mul\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("i32.load  ;; load element\n");
+        try self.emitIndent();
+        try self.emit("local.tee $filter_elem\n");
+
+        // Apply predicate function (call_indirect for lambda)
+        // The predicate should be in args[0], push element and call
+        if (args[0] == .identifier) {
+            // Check if it's a lambda variable
+            const id = args[0].identifier;
+            if (self.lambda_vars.contains(id.name)) {
+                try self.emitIndent();
+                try self.emit("local.get $");
+                try self.emit(id.name);
+                try self.emit("\n");
+                try self.emitIndent();
+                try self.emit("call_indirect (type $lambda_type_1)\n");
+            } else {
+                // Regular function call
+                try self.emitIndent();
+                try self.emit("call $");
+                try self.emit(id.name);
+                try self.emit("\n");
+            }
+        } else if (args[0] == .lambda) {
+            // Inline lambda - generate and call
+            // For simplicity, just call with element on stack
+            try self.emitIndent();
+            try self.emit(";; inline predicate (stub - returns true)\n");
+            try self.emitIndent();
+            try self.emit("drop\n");
+            try self.emitIndent();
+            try self.emit("i32.const 1  ;; default: include all\n");
+        } else {
+            // Other expression - evaluate it
+            try self.emitIndent();
+            try self.emit("drop  ;; drop element for unsupported predicate\n");
+            try self.genExpr(&args[0]);
+        }
+
+        // If predicate returned true (non-zero), append to result
+        try self.emitIndent();
+        try self.emit("if\n");
+        self.indent_level += 1;
+
+        // Store element in new array: filter_arr + 8 + (filter_len * 4)
+        try self.emitIndent();
+        try self.emit("local.get $filter_arr\n");
+        try self.emitIndent();
+        try self.emit("i32.const 8\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $filter_len\n");
+        try self.emitIndent();
+        try self.emit("i32.const 4\n");
+        try self.emitIndent();
+        try self.emit("i32.mul\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.get $filter_elem\n");
+        try self.emitIndent();
+        try self.emit("i32.store\n");
+
+        // Increment filter_len
+        try self.emitIndent();
+        try self.emit("local.get $filter_len\n");
+        try self.emitIndent();
+        try self.emit("i32.const 1\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.set $filter_len\n");
+
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit("end\n");
+
+        // Increment i
+        try self.emitIndent();
+        try self.emit("local.get $filter_i\n");
+        try self.emitIndent();
+        try self.emit("i32.const 1\n");
+        try self.emitIndent();
+        try self.emit("i32.add\n");
+        try self.emitIndent();
+        try self.emit("local.set $filter_i\n");
+
+        // Loop back
+        try self.emitIndent();
+        try self.emit("br $filter_loop\n");
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit("end\n");
+        self.indent_level -= 1;
+        try self.emitIndent();
+        try self.emit(")\n");
+
+        // Update final length in result array
+        try self.emitIndent();
+        try self.emit("local.get $filter_arr\n");
+        try self.emitIndent();
+        try self.emit("local.get $filter_len\n");
+        try self.emitIndent();
+        try self.emit("i32.store\n");
+
+        // Return new array
+        try self.emitIndent();
+        try self.emit("local.get $filter_arr\n");
     }
 
     fn genArrayReduce(self: *WasmCodegen, array_expr: *ast.Expr, args: []ast.Expr) !void {
